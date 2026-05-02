@@ -357,17 +357,32 @@ def _run_grounding_dino_detection(
         # Post-process — get bounding boxes in pixel coordinates
         w, h = rgb_image.size
         target_sizes = torch.tensor([[h, w]])
-        results = gdino_processor.post_process_grounded_object_detection(
-            outputs,
-            inputs["input_ids"],
-            target_sizes=target_sizes,
-            box_threshold=box_threshold,
-            text_threshold=text_threshold,
-        )[0]
+        try:
+            # Try new API (transformers >= 5.x — no threshold kwargs)
+            results = gdino_processor.post_process_grounded_object_detection(
+                outputs,
+                inputs["input_ids"],
+                target_sizes=target_sizes,
+            )[0]
+        except TypeError:
+            # Fallback: old API (transformers < 5.x — with threshold kwargs)
+            results = gdino_processor.post_process_grounded_object_detection(
+                outputs,
+                inputs["input_ids"],
+                target_sizes=target_sizes,
+                box_threshold=box_threshold,
+                text_threshold=text_threshold,
+            )[0]
 
         # Extract boxes and scores
         boxes = results["boxes"].cpu().numpy()  # (N, 4) — [x1, y1, x2, y2] pixel coords
         scores = results["scores"].cpu().numpy()
+
+        # Apply thresholds manually if using new API (filter by score)
+        if scores.ndim > 0 and len(scores) > 0:
+            keep = scores >= box_threshold
+            boxes = boxes[keep]
+            scores = scores[keep]
         labels = results.get("text_labels", results.get("labels", []))
 
         detections = []
@@ -1051,7 +1066,7 @@ def run_lac_pipeline(config: Dict):
             logger.warning(f"No image pairs found in {folder.name}")
             continue
 
-        pairs = filter_image_pairs(pairs, config)
+        pairs = filter_image_pairs(pairs, config, folder_name=folder.name)
 
         for i, (rgb_path, depth_path, image_id) in enumerate(pairs):
             try:
@@ -1138,6 +1153,11 @@ def parse_args():
         help="Specific image IDs to process (e.g., image28 image86)",
     )
     parser.add_argument(
+        "--gt_dir", type=str, default=None,
+        help="Path to annotated ground truth directory. Reads exact folder→image "
+             "mapping so only annotated images are processed in their specific folders.",
+    )
+    parser.add_argument(
         "--folders", nargs="+", default=None,
         help="Specific folder names to process",
     )
@@ -1189,10 +1209,15 @@ def merge_args(config: Dict, args: argparse.Namespace) -> Dict:
             config["model"][stage]["hf_model_id"] = args.hf_model_id
 
     # --reasoner_model / --evaluator_model override individual stages
+    # When --reasoner_model is set without --evaluator_model, reuse same model for both
     if getattr(args, "reasoner_model", None):
         name, hf_id = _resolve_model_id(args.reasoner_model)
         config["model"]["reasoner"]["name"] = name
         config["model"]["reasoner"]["hf_model_id"] = hf_id
+        # Also set evaluator to same model unless explicitly overridden
+        if not getattr(args, "evaluator_model", None):
+            config["model"]["evaluator"]["name"] = name
+            config["model"]["evaluator"]["hf_model_id"] = hf_id
 
     if getattr(args, "evaluator_model", None):
         name, hf_id = _resolve_model_id(args.evaluator_model)
@@ -1225,6 +1250,13 @@ def merge_args(config: Dict, args: argparse.Namespace) -> Dict:
             else:
                 ids.append(int(img_id))
         config["pipeline"]["specific_images"] = ids
+
+    if getattr(args, "gt_dir", None):
+        from pipeline import read_gt_directory
+        gt_mapping = read_gt_directory(args.gt_dir)
+        config["pipeline"]["gt_folder_images"] = gt_mapping
+        if gt_mapping:
+            config["data"]["folders"] = list(gt_mapping.keys())
 
     if getattr(args, "folders", None):
         config["data"]["folders"] = args.folders
