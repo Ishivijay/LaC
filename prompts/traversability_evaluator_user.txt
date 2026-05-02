@@ -1,0 +1,1 @@
+Evaluate the traversability of each identified free ground area. Output strictly in the specified JSON format.

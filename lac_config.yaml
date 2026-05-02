@@ -1,0 +1,119 @@
+# LaC-adapted Free Ground Space Detection Pipeline
+# ===================================================
+# Based on "Language as Cost" (LaC) by Oh et al., IROS 2025
+# Adapted for free ground detection using local VLMs instead of GPT-4o
+#
+# This config is the SINGLE SOURCE OF TRUTH for all model names,
+# segmentation methods, thresholds, and pipeline behaviour.
+# CLI args override values here when provided.
+
+# Data paths
+data:
+  base_dir: "/home/woody/iwnt/iwnt164h/mlp_dataset/prospthesisproject-Data/Code/Data"
+  rgb_subfolder: "sharpen_rgb/PNG"
+  depth_subfolder: "marigold_zero_shot/depth_colored"
+
+# Model configuration
+model:
+  # ------------------------------------------------------------------
+  # Free Ground Reasoner (Stage 1) — VLM that identifies flat floor
+  # ------------------------------------------------------------------
+  reasoner:
+    name: "Qwen2.5-VL-7B-Instruct"
+    hf_model_id: "Qwen/Qwen2.5-VL-7B-Instruct"
+    quantization: "4bit"          # "4bit", "8bit", "none"
+    dtype: "auto"                 # "auto", "bfloat16", "float16"
+    max_new_tokens: 1024
+    temperature: 0.1
+
+  # ------------------------------------------------------------------
+  # Traversability Evaluator (Stage 2) — VLM that scores walkability
+  # ------------------------------------------------------------------
+  evaluator:
+    name: "Qwen2.5-VL-7B-Instruct"
+    hf_model_id: "Qwen/Qwen2.5-VL-7B-Instruct"
+    quantization: "4bit"
+    dtype: "auto"
+    max_new_tokens: 512
+    temperature: 0.1
+
+  # ------------------------------------------------------------------
+  # Segmentation (Stage 3)
+  # ------------------------------------------------------------------
+  # method: one of "sam", "grounding_dino", "vlm_only"
+  #
+  #   "sam"            — VLM bbox percentages → SAM mask (default)
+  #   "grounding_dino" — text prompt → Grounding-DINO bbox → SAM mask
+  #                      (better bboxes than VLM percentage predictions)
+  #   "vlm_only"       — VLM bbox percentages → rectangular mask
+  #                      (no extra model download needed)
+  # ------------------------------------------------------------------
+  segmentation:
+    method: "grounding_dino"
+
+    # SAM settings (used by "sam" and "grounding_dino" methods)
+    sam_model_id: "facebook/sam-vit-base"
+    device: "cuda"
+
+    # Grounding-DINO settings (used by "grounding_dino" method only)
+    grounding_dino_model_id: "IDEA-Research/grounding-dino-tiny"
+    grounding_dino_text_prompt: "flat floor . floor . ground ."
+    grounding_dino_box_threshold: 0.3
+    grounding_dino_text_threshold: 0.25
+
+# Pipeline settings
+pipeline:
+  # Input mode for VLM: "rgb_only", "rgb_depth_overlay"
+  input_mode: "rgb_depth_overlay"
+  overlay_alpha: 0.4
+  # Depth flatness validation: masks with depth std > threshold are filtered (stairs/inclines)
+  depth_flatness_threshold: 80
+
+  # Which stages to run
+  run_reasoner: true
+  run_evaluator: true
+  run_segmentation: true
+  run_cost_map: true
+
+  # Specific images (null = all)
+  specific_images: null
+  folders: null
+
+# Output settings
+output:
+  dir: "/home/woody/iwnt/iwnt164h/free_ground_results"
+  save_individual_json: true
+  save_visualizations: true
+  save_cost_maps: true
+
+# Cost map parameters
+cost_map:
+  # Resolution of the cost map in pixels (per meter)
+  resolution: 0.05
+  # Map size in meters (from robot)
+  map_size: 5.0
+  # Gaussian sigma base (multiplied by traversability score)
+  sigma_base: 0.3
+  # Max cost value for obstacles
+  obstacle_cost: 1.0
+  # Free ground cost (lower = safer)
+  free_ground_cost: 0.1
+
+# =====================================================================
+# AVAILABLE MODELS (pre-cached on HPC cluster)
+# =====================================================================
+# Uncomment + edit the reasoner/evaluator blocks above to switch.
+#
+# VLMs (Vision-Language):
+#   Qwen/Qwen2.5-VL-7B-Instruct       — 7B, fast, good grounding
+#   Qwen/Qwen3.5-27B                   — 27B text-only (no vision)
+#   Qwen/Qwen3.5-4B                    — 4B text-only (no vision)
+#   meta-llama/Llama-3.2-11B-Vision-Instruct — 11B VLM
+#   google/gemma-4-31B-it              — 31B VLM
+#   ChaimZhu/LLaVA-3D-7B              — 7B 3D-aware VLM
+#
+# Segmentation:
+#   facebook/sam-vit-base              — SAM ViT-B (~375 MB)
+#   facebook/sam3                      — SAM 3 (newer)
+#   IDEA-Research/grounding-dino-tiny  — Grounding-DINO (~660 MB)
+# =====================================================================
