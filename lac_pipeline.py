@@ -147,6 +147,14 @@ def parse_reasoner_output(response: str) -> Dict:
     # Try to parse as JSON
     try:
         result = json.loads(cleaned)
+        # VLM may return a list instead of dict — wrap it
+        if isinstance(result, list):
+            logger.warning(f"Reasoner returned a list ({len(result)} items), wrapping as dict")
+            return {
+                "free_ground_areas": result,
+                "navigability_reasoning": "",
+                "obstacles": [],
+            }
         return result
     except json.JSONDecodeError:
         # Try to find JSON in the response
@@ -154,6 +162,12 @@ def parse_reasoner_output(response: str) -> Dict:
         if json_match:
             try:
                 result = json.loads(json_match.group())
+                if isinstance(result, list):
+                    return {
+                        "free_ground_areas": result,
+                        "navigability_reasoning": "",
+                        "obstacles": [],
+                    }
                 return result
             except json.JSONDecodeError:
                 pass
@@ -234,12 +248,27 @@ def parse_evaluator_output(response: str) -> Dict:
 
     try:
         result = json.loads(cleaned)
+        # VLM may return a list instead of dict — wrap it
+        if isinstance(result, list):
+            logger.warning(f"Evaluator returned a list ({len(result)} items), wrapping as dict")
+            return {
+                "traversability_reasoning": "",
+                "traversability_score": {},
+                "raw_list_response": result,
+            }
         return result
     except json.JSONDecodeError:
         json_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if json_match:
             try:
-                return json.loads(json_match.group())
+                result = json.loads(json_match.group())
+                if isinstance(result, list):
+                    return {
+                        "traversability_reasoning": "",
+                        "traversability_score": {},
+                        "raw_list_response": result,
+                    }
+                return result
             except json.JSONDecodeError:
                 pass
 
