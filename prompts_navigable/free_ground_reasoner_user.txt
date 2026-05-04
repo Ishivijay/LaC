@@ -1,0 +1,1 @@
+Analyze this indoor scene and identify all free navigable areas — including flat floor, stairs, landings, and any walkable surfaces. Exclude walls, railings, windows, doors, and obstacles. Output strictly in the JSON format specified.

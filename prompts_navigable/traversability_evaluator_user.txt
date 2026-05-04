@@ -1,0 +1,1 @@
+Evaluate the traversability of each identified navigable area. Remember: flat floor AND stairs are both traversable. Only walls, railings, windows, doors, and obstacles should score 0. Output strictly in the specified JSON format.

@@ -46,9 +46,10 @@ _WORK_DIR = os.environ.get("WORK", str(Path(__file__).parent.parent))
 _LOG_MODEL_NAME = "LaC"  # overwritten in main() once config is known
 
 
-def _make_log_dir(model_name: str) -> Path:
-    """Create log directory under $WORK/free_ground_results/<model>_LaC/logs/."""
-    d = Path(_WORK_DIR) / "free_ground_results" / f"{model_name}_LaC" / "logs"
+def _make_log_dir(model_name: str, suffix: str = "") -> Path:
+    """Create log directory under $WORK/free_ground_results/<model>_LaC<suffix>/logs/."""
+    lac_folder = f"{model_name}_LaC{suffix}" if suffix else f"{model_name}_LaC"
+    d = Path(_WORK_DIR) / "free_ground_results" / lac_folder / "logs"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -79,12 +80,20 @@ from pipeline import (
 # Prompt Loading
 # ---------------------------------------------------------------------------
 
-PROMPT_DIR = Path(__file__).parent / "prompts"
+# Default prompt directory — can be overridden via --prompt_dir
+DEFAULT_PROMPT_DIR = Path(__file__).parent / "prompts"
+_active_prompt_dir = DEFAULT_PROMPT_DIR
+
+
+def set_prompt_dir(prompt_dir: Path):
+    """Set the active prompt directory (called from main() after arg parsing)."""
+    global _active_prompt_dir
+    _active_prompt_dir = prompt_dir
 
 
 def load_prompt(filename: str) -> str:
-    """Load a prompt template from the prompts directory."""
-    path = PROMPT_DIR / filename
+    """Load a prompt template from the active prompts directory."""
+    path = _active_prompt_dir / filename
     if not path.exists():
         raise FileNotFoundError(f"Prompt file not found: {path}")
     with open(path) as f:
@@ -1038,7 +1047,9 @@ def run_lac_pipeline(config: Dict):
     model_name = config["model"]["reasoner"]["name"]
     input_mode = config["pipeline"].get("input_mode", "rgb_depth_overlay")
     seg_method = config["model"].get("segmentation", {}).get("method", "vlm_only")
-    output_dir = Path(config["output"]["dir"]) / f"{model_name}_LaC" / f"{input_mode}_{seg_method}"
+    lac_suffix = config["pipeline"].get("output_suffix", "")
+    lac_folder = f"{model_name}_LaC{lac_suffix}" if lac_suffix else f"{model_name}_LaC"
+    output_dir = Path(config["output"]["dir"]) / lac_folder / f"{input_mode}_{seg_method}"
     if config["pipeline"].get("clean_output", False) and output_dir.exists():
         logger.info(f"Cleaning output directory: {output_dir}")
         shutil.rmtree(output_dir)
@@ -1199,6 +1210,16 @@ def parse_args():
         help="Comma-separated stages to run: reasoner,evaluator,segmentation,costmap",
     )
     parser.add_argument(
+        "--prompt_dir", type=str, default=None,
+        help="Path to custom prompt directory (default: lac_free_ground/prompts/). "
+             "Use 'prompts_navigable' for the navigable-area variant.",
+    )
+    parser.add_argument(
+        "--output_suffix", type=str, default=None,
+        help="Suffix appended to output folder name (e.g., 'navigable' → {model}_LaC_navigable/...). "
+             "Prevents overwriting previous results.",
+    )
+    parser.add_argument(
         "--clean", action="store_true",
         help="Remove output directory before running (avoids stale files)",
     )
@@ -1303,6 +1324,9 @@ def merge_args(config: Dict, args: argparse.Namespace) -> Dict:
     if getattr(args, "clean", False):
         config["pipeline"]["clean_output"] = True
 
+    if getattr(args, "output_suffix", None):
+        config["pipeline"]["output_suffix"] = args.output_suffix
+
     return config
 
 
@@ -1318,6 +1342,14 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    # Set custom prompt directory if provided
+    if getattr(args, "prompt_dir", None):
+        prompt_path = Path(args.prompt_dir)
+        if not prompt_path.is_absolute():
+            prompt_path = Path(__file__).parent / prompt_path
+        set_prompt_dir(prompt_path)
+        logger.info(f"Using custom prompt directory: {prompt_path}")
+
     # Load config
     config_path = args.config
     if not Path(config_path).exists():
@@ -1328,7 +1360,8 @@ def main():
 
     # Reconfigure logging with model-specific directory
     model_name = config["model"]["reasoner"]["name"]
-    log_dir = _make_log_dir(model_name)
+    output_suffix = config["pipeline"].get("output_suffix", "")
+    log_dir = _make_log_dir(model_name, suffix=output_suffix)
     log_file = log_dir / f"lac_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     root_logger = logging.getLogger()
     # Remove existing handlers and add new ones with model-specific path
