@@ -354,17 +354,66 @@ def _load_grounding_dino_model(config: Dict):
         _gdino_cache["failed"] = True
 
 
+def _build_gdino_prompt_from_vlm(areas: List[Dict], default_prompt: str) -> str:
+    """Build a Grounding-DINO text prompt from VLM-identified areas.
+
+    Follows the LaC paper approach: VLM output drives the segmentation model.
+    Extracts area names/types and converts them to Grounding-DINO format.
+    Falls back to default_prompt if VLM found no areas.
+    """
+    if not areas:
+        return default_prompt
+
+    # Collect unique terms from VLM area names and types
+    terms = set()
+    for area in areas:
+        name = area.get("name", "").lower()
+        area_type = area.get("type", "").lower()
+
+        # Add the type if available (e.g., "flat_floor", "stairs_up")
+        if area_type:
+            # Convert "flat_floor" → "floor", "stairs_up" → "stairs"
+            for part in area_type.replace("_", " ").split():
+                if part not in ("up", "down", "flat", "area", "surface"):
+                    terms.add(part)
+
+        # Extract key nouns from the name (e.g., "corridor floor" → "floor", "corridor")
+        skip_words = {"the", "a", "an", "of", "in", "on", "at", "to", "and", "area", "surface",
+                       "left", "right", "center", "bottom", "top", "side", "main", "small",
+                       "large", "wide", "narrow"}
+        for word in name.split():
+            w = word.strip(".,;:()").lower()
+            if w and w not in skip_words and len(w) > 2:
+                terms.add(w)
+
+    if not terms:
+        return default_prompt
+
+    # Build Grounding-DINO prompt: "term1 . term2 . term3 ."
+    prompt = " . ".join(sorted(terms)) + " ."
+    logger.info(f"    Built Grounding-DINO prompt from VLM areas: '{prompt}'")
+    return prompt
+
+
 def _run_grounding_dino_detection(
     rgb_image: Image.Image,
     config: Dict,
+    text_prompt_override: Optional[str] = None,
 ) -> List[Dict]:
     """Run Grounding-DINO on the image to detect floor/ground regions.
+
+    Args:
+        rgb_image: Input RGB image.
+        config: Pipeline config.
+        text_prompt_override: If provided, use this prompt instead of the config default.
+            This enables VLM-driven detection following the LaC paper approach.
 
     Returns a list of bbox dicts with pixel coordinates:
         [{"x1": int, "y1": int, "x2": int, "y2": int, "score": float}, ...]
     """
     seg_config = config["model"].get("segmentation", {})
-    text_prompt = seg_config.get("grounding_dino_text_prompt", "flat floor . floor . ground .")
+    default_prompt = seg_config.get("grounding_dino_text_prompt", "flat floor . floor . ground .")
+    text_prompt = text_prompt_override if text_prompt_override else default_prompt
     box_threshold = seg_config.get("grounding_dino_box_threshold", 0.3)
     text_threshold = seg_config.get("grounding_dino_text_threshold", 0.25)
 
@@ -453,18 +502,21 @@ def run_segmentation(
     rgb_image: Image.Image,
     bboxes: List[Dict],
     config: Dict,
+    vlm_areas: Optional[List[Dict]] = None,
 ) -> Tuple[List[np.ndarray], List[Dict]]:
     """Stage 3: Segment free ground areas.
 
     Dispatches to the configured segmentation method:
       - "sam"            — VLM bbox → SAM mask
-      - "grounding_dino" — text prompt → Grounding-DINO bbox → SAM mask
+      - "grounding_dino" — VLM area descriptions → Grounding-DINO bbox → SAM mask
       - "vlm_only"       — VLM bbox → rectangular mask
 
     Args:
         rgb_image: Input RGB image.
         bboxes: List of bbox dicts from VLM reasoner with keys: x1, y1, x2, y2 (%).
         config: Pipeline config.
+        vlm_areas: List of VLM-identified area dicts (with name, type, bbox, reasoning).
+                   Used to build Grounding-DINO text prompt following the LaC paper approach.
 
     Returns:
         Tuple of (masks, bboxes_used) where:
@@ -477,7 +529,7 @@ def run_segmentation(
 
     # ----- Grounding-DINO method -----
     if method == "grounding_dino":
-        return _segment_with_grounding_dino(rgb_image, bboxes, config)
+        return _segment_with_grounding_dino(rgb_image, bboxes, config, vlm_areas=vlm_areas)
 
     # ----- SAM method (VLM bbox → SAM) -----
     if method == "sam":
@@ -492,17 +544,26 @@ def _segment_with_grounding_dino(
     rgb_image: Image.Image,
     vlm_bboxes: List[Dict],
     config: Dict,
+    vlm_areas: Optional[List[Dict]] = None,
 ) -> Tuple[List[np.ndarray], List[Dict]]:
     """Grounding-DINO detection → SAM segmentation.
 
-    Uses Grounding-DINO to get better bounding boxes from text prompts,
-    then feeds those pixel-accurate boxes to SAM for mask generation.
+    Follows the LaC paper approach: VLM-identified areas drive the
+    Grounding-DINO text prompt. If the VLM found areas, their names/types
+    are converted to a detection prompt. If not, falls back to the default.
+
+    Then feeds Grounding-DINO pixel-accurate boxes to SAM for mask generation.
     Falls back to VLM bboxes → SAM if Grounding-DINO fails.
     """
     w, h = rgb_image.size
 
-    # Run Grounding-DINO detection
-    gdino_detections = _run_grounding_dino_detection(rgb_image, config)
+    # Build Grounding-DINO prompt from VLM areas (LaC paper approach)
+    seg_config = config["model"].get("segmentation", {})
+    default_prompt = seg_config.get("grounding_dino_text_prompt", "flat floor . floor . ground .")
+    gdino_prompt = _build_gdino_prompt_from_vlm(vlm_areas or [], default_prompt)
+
+    # Run Grounding-DINO detection with VLM-driven prompt
+    gdino_detections = _run_grounding_dino_detection(rgb_image, config, text_prompt_override=gdino_prompt)
 
     if not gdino_detections:
         logger.info("    Grounding-DINO found no detections, falling back to VLM bboxes → SAM")
@@ -940,7 +1001,7 @@ def process_single_image_lac(
     if config["pipeline"].get("run_segmentation", True):
         logger.info(f"  Stage 3: Segmentation — method={seg_method} ({len(vlm_bboxes)} VLM regions)...")
         t0 = time.time()
-        masks, bboxes_used = run_segmentation(rgb_image, vlm_bboxes, config)
+        masks, bboxes_used = run_segmentation(rgb_image, vlm_bboxes, config, vlm_areas=filtered_areas)
         t1 = time.time()
         logger.info(f"    Generated {len(masks)} masks ({t1-t0:.1f}s)")
 
