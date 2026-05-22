@@ -14,9 +14,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_DIR="${WORK:-/home/woody/iwnt/iwnt164h}"
-PY="/usr/bin/python3"
+PY="$WORK_DIR/venvs/marigold/bin/python3"
 RESULTS_DIR="$WORK_DIR/free_ground_results"
-GT_DIR="/home/woody/iwnt/iwnt164h/mlp_dataset/prospthesisproject-Data/Code/annotated_samples/sam3_output_v7"
+GT_DIR="$RESULTS_DIR/Annotated_Ground_Truth"
 
 DRY_RUN=false
 

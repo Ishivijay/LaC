@@ -1,0 +1,40 @@
+{
+  "description": "The image shows a corridor with a flat floor and a staircase. The floor appears to be tiled and extends across the bottom half of the image. The staircase has a distinct step pattern and is located in the center of the image.",
+  "free_ground_areas": [
+    {
+      "name": "floor area",
+      "type": "flat_floor",
+      "position": "bottom-center",
+      "bbox": {
+        "x1": 20,
+        "y1": 50,
+        "x2": 98,
+        "y2": 90
+      },
+      "reasoning": "The floor is tiled and appears to be flat and level. There are no visible stairs or ramps in the foreground. The depth map shows uniform depth coloring indicating a flat surface.",
+      "traversability_score": 3,
+      "traversability_reasoning": "Wide, flat, clear corridor floor. No hazards nearby."
+    },
+    {
+      "name": "staircase",
+      "type": "stairs_up",
+      "position": "center",
+      "bbox": {
+        "x1": 30,
+        "y1": 30,
+        "x2": 70,
+        "y2": 65
+      },
+      "reasoning": "Staircase going up with visible step pattern. The depth map shows distinct horizontal color bands indicating steps. Bordered by railings on both sides which are EXCLUDED.",
+      "traversability_score": 2,
+      "traversability_reasoning": "Stairs are walkable but require caution. Moderate traversability."
+    }
+  ],
+  "navigability_reasoning": "The corridor floor is highly traversable. The staircase is moderately traversable.",
+  "obstacles": [
+    "wall",
+    "railing",
+    "window",
+    "door"
+  ]
+}

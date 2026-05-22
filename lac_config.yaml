@@ -40,16 +40,23 @@ model:
   # ------------------------------------------------------------------
   # Segmentation (Stage 3)
   # ------------------------------------------------------------------
-  # method: one of "sam", "grounding_dino", "vlm_only"
+  # method: one of "sam", "sam3", "grounding_dino", "vlm_only"
   #
-  #   "sam"            — VLM bbox percentages → SAM mask (default)
+  #   "sam3"           — VLM area descriptions → SAM3 text-prompted mask (recommended)
+  #                      Best quality: uses VLM text output directly as SAM3 prompts.
+  #                      0.8B params, ~1.6 GB VRAM (float16).
+  #   "sam"            — VLM bbox percentages → SAM mask
   #   "grounding_dino" — text prompt → Grounding-DINO bbox → SAM mask
-  #                      (better bboxes than VLM percentage predictions)
+  #                      (tends to over-segment with generic prompts)
   #   "vlm_only"       — VLM bbox percentages → rectangular mask
   #                      (no extra model download needed)
   # ------------------------------------------------------------------
   segmentation:
-    method: "grounding_dino"
+    method: "sam3"
+
+    # SAM3 settings (used by "sam3" method) — text-prompted segmentation
+    sam3_model_id: "facebook/sam3"
+    sam3_mask_threshold: 0.5
 
     # SAM settings (used by "sam" and "grounding_dino" methods)
     sam_model_id: "facebook/sam-vit-base"
@@ -63,9 +70,8 @@ model:
 
 # Pipeline settings
 pipeline:
-  # Input mode for VLM: "rgb_only", "rgb_depth_overlay"
-  input_mode: "rgb_depth_overlay"
-  overlay_alpha: 0.4
+  # Input mode for VLM: "rgb_only", "rgb_depth_separate"
+  input_mode: "rgb_depth_separate"
   # Depth flatness validation: masks with depth std > threshold are filtered (stairs/inclines)
   depth_flatness_threshold: 80
 

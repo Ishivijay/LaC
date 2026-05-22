@@ -36,50 +36,99 @@ from PIL import Image
 
 WORK_DIR = Path(os.environ.get("WORK", "/home/woody/iwnt/iwnt164h"))
 DEFAULT_RESULTS_DIR = WORK_DIR / "free_ground_results"
-DEFAULT_GT_MASK_DIR = (
-    Path("/home/woody/iwnt/iwnt164h/mlp_dataset/prospthesisproject-Data/Code")
-    / "annotated_samples" / "sam3_output_v7"
-)
+DEFAULT_GT_MASK_DIR = WORK_DIR / "free_ground_results" / "Annotated_Ground_Truth"
 DEFAULT_DATA_DIR = (
     WORK_DIR / "mlp_dataset" / "prospthesisproject-Data" / "Code" / "Data"
 )
 DEFAULT_OUTPUT_DIR = WORK_DIR / "free_ground_results" / "lac_navigable_comparison"
 
-GT_ANNOTATIONS = {
-    "LA_Downstairs_image28": ("lms_kamal_LA_downstairs_Nopeople_1", "image28"),
-    "LA_Upstairs_image188":  ("lms_kamal_LA_upstairs_Nopeople_1", "image188"),
-    "LA_Upstairs_image86":   ("lms_kamal_LA_upstairs_Nopeople_1", "image86"),
-    "LB_Upstairs_image147":  ("lms_kamal_LB_upstairs_Nopeople_2", "image147"),
-    "RA_Downstairs_image36": ("lms_kamal_RA_downstairs_Nopeople_1", "image36"),
-    "RA_Upstairs_image28":   ("lms_kamal_RA_upstairs_Nopeople_1", "image28"),
-    "RB_Downstairs_image95": ("lms_kamal_RB_downstairs_Nopeople_1", "image95"),
-}
+
+def discover_gt_annotations(gt_mask_dir: Path) -> Dict[str, tuple]:
+    """Auto-discover GT masks from directory structure.
+
+    Supports two formats:
+      1. Subfolder format: {gt_dir}/{folder_name}/{image_id}_mask.png
+      2. Flat format: {gt_dir}/{prefix}_{image_id}_mask.png  (sam3_output_v7 style)
+
+    Returns dict: gt_key → (folder_name, image_id)
+    """
+    annotations = {}
+
+    # Check for subfolder format: {gt_dir}/{folder}/image*_mask.png
+    subfolders = [d for d in gt_mask_dir.iterdir() if d.is_dir()]
+    if subfolders:
+        for subfolder in sorted(subfolders):
+            folder_name = subfolder.name
+            for mask_file in sorted(subfolder.glob("*_mask.png")):
+                image_id = mask_file.stem.replace("_mask", "")
+                gt_key = f"{folder_name}/{image_id}"
+                annotations[gt_key] = (folder_name, image_id)
+        if annotations:
+            return annotations
+
+    # Fallback: flat format with {prefix}_{image_id}_mask.png
+    SAM3_MAPPING = {
+        "LA_Downstairs_image28": ("lms_kamal_LA_downstairs_Nopeople_1", "image28"),
+        "LA_Upstairs_image188":  ("lms_kamal_LA_upstairs_Nopeople_1", "image188"),
+        "LA_Upstairs_image86":   ("lms_kamal_LA_upstairs_Nopeople_1", "image86"),
+        "LB_Upstairs_image147":  ("lms_kamal_LB_upstairs_Nopeople_2", "image147"),
+        "RA_Downstairs_image36": ("lms_kamal_RA_downstairs_Nopeople_1", "image36"),
+        "RA_Upstairs_image28":   ("lms_kamal_RA_upstairs_Nopeople_1", "image28"),
+        "RB_Downstairs_image95": ("lms_kamal_RB_downstairs_Nopeople_1", "image95"),
+    }
+    for mask_file in sorted(gt_mask_dir.glob("*_mask.png")):
+        stem = mask_file.stem.replace("_mask", "")
+        if stem in SAM3_MAPPING:
+            annotations[stem] = SAM3_MAPPING[stem]
+
+    return annotations
 
 MODELS = ["Qwen2.5-VL-7B-Instruct", "gemma-4-E4B-it"]
-MODES = ["rgb_only", "rgb_depth_overlay"]
+MODES = ["rgb_only", "rgb_depth_separate"]
+
+_MODE_LABELS = {
+    "rgb_only": "RGB only",
+    "rgb_depth_separate": "RGB+D separate",
+}
 
 
-def _build_strategies():
-    """Build strategy definitions for comparison."""
+def _build_strategies(seg_methods=None):
+    """Build strategy definitions for comparison.
+
+    Args:
+        seg_methods: List of segmentation methods to include.
+                     Defaults to ["grounding_dino", "sam3"].
+                     Pass ["sam3"] for SAM3-only comparison.
+    """
+    if seg_methods is None:
+        seg_methods = ["grounding_dino", "sam3"]
     strategies = []
     for model in MODELS:
         for mode in MODES:
-            mode_label = "RGB only" if mode == "rgb_only" else "RGB+D overlay"
-            strategies.append({
-                "label": f"{model} — {mode_label}",
-                "short": f"{model}_{mode}",
-                "model": model,
-                "mode": mode,
-                "results_subdir": f"{model}_LaC_navigable/{mode}_grounding_dino",
-            })
+            mode_label = _MODE_LABELS.get(mode, mode)
+            for seg_method in seg_methods:
+                seg_label = "G-DINO+SAM" if seg_method == "grounding_dino" else "SAM3"
+                strategies.append({
+                    "label": f"{model} — {mode_label}, {seg_label}",
+                    "short": f"{model}_{mode}_{seg_method}",
+                    "model": model,
+                    "mode": mode,
+                    "results_subdir": f"{model}_LaC_navigable/{mode}_{seg_method}",
+                })
     return strategies
 
 
 STRATEGIES = _build_strategies()
 
 COLORS = {
-    "Qwen2.5-VL-7B-Instruct": {"rgb_only": "#1976D2", "rgb_depth_overlay": "#42A5F5"},
-    "gemma-4-E4B-it":         {"rgb_only": "#D32F2F", "rgb_depth_overlay": "#EF5350"},
+    "Qwen2.5-VL-7B-Instruct": {
+        "rgb_only": "#1976D2",
+        "rgb_depth_separate": "#0D47A1",
+    },
+    "gemma-4-E4B-it": {
+        "rgb_only": "#D32F2F",
+        "rgb_depth_separate": "#B71C1C",
+    },
 }
 
 
@@ -101,9 +150,17 @@ def load_predicted_mask(mask_path: Path, target_size: Tuple[int, int]) -> np.nda
     return (mask > 127).astype(np.uint8)
 
 
-def combine_predicted_masks(mask_dir: Path, target_h: int, target_w: int) -> np.ndarray:
+def combine_predicted_masks(mask_dir: Path, target_h: int, target_w: int,
+                            image_id: str = None) -> np.ndarray:
+    """Combine individual mask PNGs into a single binary mask.
+    Args:
+        image_id: If provided, only combine masks starting with ``{image_id}_mask_``.
+    """
     combined = np.zeros((target_h, target_w), dtype=np.uint8)
     mask_files = [f for f in mask_dir.glob("*.png") if "overlay" not in f.name]
+    if image_id is not None:
+        prefix = f"{image_id}_mask_"
+        mask_files = [f for f in mask_files if f.name.startswith(prefix)]
     for mf in mask_files:
         mask = load_predicted_mask(mf, (target_h, target_w))
         combined = np.maximum(combined, mask)
@@ -146,7 +203,7 @@ def load_rgb_image(folder: str, image_id: str) -> Optional[np.ndarray]:
 # Evaluation
 # ──────────────────────────────────────────────────────────────────────────────
 
-def evaluate_strategy(strategy: Dict, results_dir: Path, gt_mask_dir: Path) -> List[Dict]:
+def evaluate_strategy(strategy: Dict, results_dir: Path, gt_mask_dir: Path, gt_annotations: Dict) -> List[Dict]:
     """Evaluate a single strategy, return per-image results."""
     run_dir = results_dir / strategy["results_subdir"]
     if not run_dir.exists():
@@ -154,8 +211,11 @@ def evaluate_strategy(strategy: Dict, results_dir: Path, gt_mask_dir: Path) -> L
         return []
 
     results = []
-    for gt_name, (folder, image_id) in GT_ANNOTATIONS.items():
-        gt_mask_path = gt_mask_dir / f"{gt_name}_mask.png"
+    for gt_name, (folder, image_id) in gt_annotations.items():
+        # Support both subfolder and flat GT mask formats
+        gt_mask_path = gt_mask_dir / folder / f"{image_id}_mask.png"
+        if not gt_mask_path.exists():
+            gt_mask_path = gt_mask_dir / f"{gt_name}_mask.png"
         if not gt_mask_path.exists():
             continue
         gt_mask = load_gt_mask(gt_mask_path)
@@ -166,9 +226,10 @@ def evaluate_strategy(strategy: Dict, results_dir: Path, gt_mask_dir: Path) -> L
         pred_mask = np.zeros((h, w), dtype=np.uint8)
         num_masks = 0
         if mask_dir.exists():
-            mask_pngs = [f for f in mask_dir.glob("*.png") if "overlay" not in f.name]
+            mask_pngs = [f for f in mask_dir.glob(f"{image_id}_mask_*.png")
+                         if "overlay" not in f.name]
             if mask_pngs:
-                pred_mask = combine_predicted_masks(mask_dir, h, w)
+                pred_mask = combine_predicted_masks(mask_dir, h, w, image_id=image_id)
                 num_masks = len(mask_pngs)
 
         metrics = compute_metrics(pred_mask, gt_mask)
@@ -197,12 +258,15 @@ def evaluate_strategy(strategy: Dict, results_dir: Path, gt_mask_dir: Path) -> L
     return results
 
 
-def load_or_compute_evaluations(results_dir: Path, gt_mask_dir: Path) -> Dict[str, List[Dict]]:
+def load_or_compute_evaluations(results_dir: Path, gt_mask_dir: Path, gt_annotations: Dict,
+                                strategies: list = None) -> Dict[str, List[Dict]]:
     """Evaluate all strategies, return {short: [per_image_results]}."""
+    if strategies is None:
+        strategies = STRATEGIES
     all_evals = {}
-    for s in STRATEGIES:
+    for s in strategies:
         print(f"Evaluating {s['label']}...")
-        evals = evaluate_strategy(s, results_dir, gt_mask_dir)
+        evals = evaluate_strategy(s, results_dir, gt_mask_dir, gt_annotations)
         if evals:
             all_evals[s["short"]] = evals
     return all_evals
@@ -271,7 +335,7 @@ def print_comparison_tables(all_evals: Dict[str, List[Dict]]):
     print("=" * 60)
 
     # Table 4: Per-image IoU breakdown
-    gt_names = list(GT_ANNOTATIONS.keys())
+    gt_names = sorted(set(k for evals in all_evals.values() for r in evals for k in [r["gt_name"]]))
     print("\n" + "=" * 100)
     print("TABLE 4: Per-Image IoU")
     print("=" * 100)
@@ -306,7 +370,7 @@ def generate_comparison_visualizations(all_evals: Dict[str, List[Dict]], output_
 
     vis_dir = output_dir / "charts"
     vis_dir.mkdir(parents=True, exist_ok=True)
-    gt_names = list(GT_ANNOTATIONS.keys())
+    gt_names = sorted(set(k for evals in all_evals.values() for r in evals for k in [r["gt_name"]]))
 
     # ── 1. Grouped bar chart: IoU per image ──
     fig, ax = plt.subplots(figsize=(14, 6))
@@ -442,7 +506,7 @@ def save_comparison_results(all_evals: Dict[str, List[Dict]], agg_data: Dict, ou
     comparison = {
         "timestamp": datetime.now().isoformat(),
         "num_strategies": len(all_evals),
-        "num_gt_images": len(GT_ANNOTATIONS),
+        "num_gt_images": len(set(k for evals in all_evals.values() for r in evals for k in [r["gt_name"]])),
         "aggregate": {short: {k: round(float(v), 4) for k, v in agg.items()}
                       for short, agg in agg_data.items()},
         "per_image": {short: evals for short, evals in all_evals.items()},
@@ -505,7 +569,15 @@ def main():
     parser.add_argument("--results_dir", type=Path, default=DEFAULT_RESULTS_DIR)
     parser.add_argument("--gt_mask_dir", type=Path, default=DEFAULT_GT_MASK_DIR)
     parser.add_argument("--output_dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--seg_method", type=str, nargs="+",
+                        default=["grounding_dino", "sam3"],
+                        choices=["grounding_dino", "sam3"],
+                        help="Segmentation method(s) to compare (default: both). "
+                             "Use --seg_method sam3 for SAM3-only comparison.")
     args = parser.parse_args()
+
+    # Build strategies for the requested segmentation methods
+    strategies = _build_strategies(seg_methods=args.seg_method)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -520,12 +592,18 @@ def main():
     print(f"Results dir: {args.results_dir}")
     print(f"GT mask dir: {args.gt_mask_dir}")
     print(f"Output dir:  {args.output_dir}")
-    print(f"Strategies:  {len(STRATEGIES)}")
-    print(f"GT images:   {len(GT_ANNOTATIONS)}")
+    print(f"Seg methods: {args.seg_method}")
+
+    # Discover GT annotations
+    gt_annotations = discover_gt_annotations(args.gt_mask_dir)
+    print(f"Strategies:  {len(strategies)}")
+    print(f"GT images:   {len(gt_annotations)} (auto-discovered)")
     print()
 
     # Evaluate all strategies
-    all_evals = load_or_compute_evaluations(args.results_dir, args.gt_mask_dir)
+    all_evals = load_or_compute_evaluations(
+        args.results_dir, args.gt_mask_dir, gt_annotations, strategies=strategies,
+    )
     if not all_evals:
         print("No strategies could be evaluated!")
         sys.exit(1)

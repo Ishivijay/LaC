@@ -7,11 +7,12 @@ Based on "Language as Cost: Proactive Hazard Mapping using VLM for Robot Navigat
 Pipeline stages:
   1. Free Ground Reasoner (VLM) — identifies flat floor areas with bounding boxes
   2. Traversability Evaluator (VLM) — scores each area's walkability (1-3)
-  3. Segmentation — creates precise masks via SAM, Grounding-DINO+SAM, or VLM bbox
+  3. Segmentation — creates precise masks via SAM, SAM3, Grounding-DINO+SAM, or VLM bbox
   4. Gaussian Cost Map — builds traversability map from masks + depth
 
 Segmentation methods (config: model.segmentation.method):
   - "sam"            — VLM bbox percentages → SAM mask
+  - "sam3"           — VLM area descriptions → SAM3 text-prompted mask (recommended)
   - "grounding_dino" — text prompt → Grounding-DINO detection → SAM mask
   - "vlm_only"       — VLM bbox percentages → rectangular mask (no extra model)
 
@@ -19,7 +20,7 @@ Usage:
     python3 lac_pipeline.py --config lac_config.yaml
     python3 lac_pipeline.py --quick_test
     python3 lac_pipeline.py --specific_images image28 image36 image188
-    python3 lac_pipeline.py --segmentation_method grounding_dino
+    python3 lac_pipeline.py --segmentation_method sam3
 """
 
 import argparse
@@ -66,7 +67,6 @@ logger = logging.getLogger(__name__)
 sys.path.insert(0, str(Path(__file__).parent.parent / "free_ground_pipeline"))
 from pipeline import (
     MODEL_REGISTRY,
-    create_overlay_image,
     discover_folders,
     discover_image_pairs,
     filter_image_pairs,
@@ -111,19 +111,32 @@ def run_free_ground_reasoner(
 
     Uses the VLM to analyze the scene and output structured JSON
     with free ground areas, bounding boxes, and reasoning.
+
+    Input modes:
+        - rgb_only:           Single RGB image
+        - rgb_depth_separate: RGB + depth as two separate images
     """
-    input_mode = config["pipeline"].get("input_mode", "rgb_depth_overlay")
+    input_mode = config["pipeline"].get("input_mode", "rgb_depth_separate")
 
     # Load prompts
     system_prompt = load_prompt("free_ground_reasoner_system.txt")
-    user_prompt = load_prompt("free_ground_reasoner_user.txt")
 
-    # Prepare image
-    if input_mode == "rgb_depth_overlay" and depth_image is not None:
-        alpha = config["pipeline"].get("overlay_alpha", 0.4)
-        image = create_overlay_image(rgb_image, depth_image, alpha)
+    # Build user content based on input mode
+    if input_mode == "rgb_depth_separate" and depth_image is not None:
+        # Two separate images: RGB + depth with explanatory prompt
+        user_prompt = load_prompt("free_ground_reasoner_user_depth.txt")
+        user_content = [
+            {"type": "text", "text": user_prompt},
+            {"type": "image", "image": rgb_image},
+            {"type": "image", "image": depth_image},
+        ]
     else:
-        image = rgb_image
+        # RGB only (or depth not available)
+        user_prompt = load_prompt("free_ground_reasoner_user.txt")
+        user_content = [
+            {"type": "text", "text": user_prompt},
+            {"type": "image", "image": rgb_image},
+        ]
 
     # Build messages
     messages = [
@@ -133,10 +146,7 @@ def run_free_ground_reasoner(
         },
         {
             "role": "user",
-            "content": [
-                {"type": "text", "text": user_prompt},
-                {"type": "image", "image": image},
-            ],
+            "content": user_content,
         },
     ]
 
@@ -203,12 +213,15 @@ def run_traversability_evaluator(
 
     Adapted from LaC's Emotion Evaluator. Instead of anxiety scores,
     assigns traversability scores (1-3) to each identified free ground area.
+
+    Input modes:
+        - rgb_only:           Single RGB image
+        - rgb_depth_separate: RGB + depth as two separate images
     """
-    input_mode = config["pipeline"].get("input_mode", "rgb_depth_overlay")
+    input_mode = config["pipeline"].get("input_mode", "rgb_depth_separate")
 
     # Load prompt template
     system_template = load_prompt("traversability_evaluator_system.txt")
-    user_prompt = load_prompt("traversability_evaluator_user.txt")
 
     # Fill in template
     free_ground_areas = reasoner_output.get("free_ground_areas", [])
@@ -221,12 +234,22 @@ def run_traversability_evaluator(
         "{navigability_reasoning}", str(navigability_reasoning)
     )
 
-    # Prepare image
-    if input_mode == "rgb_depth_overlay" and depth_image is not None:
-        alpha = config["pipeline"].get("overlay_alpha", 0.4)
-        image = create_overlay_image(rgb_image, depth_image, alpha)
+    # Build user content based on input mode
+    if input_mode == "rgb_depth_separate" and depth_image is not None:
+        # Two separate images: RGB + depth with explanatory prompt
+        user_prompt = load_prompt("traversability_evaluator_user_depth.txt")
+        user_content = [
+            {"type": "text", "text": user_prompt},
+            {"type": "image", "image": rgb_image},
+            {"type": "image", "image": depth_image},
+        ]
     else:
-        image = rgb_image
+        # RGB only (or depth not available)
+        user_prompt = load_prompt("traversability_evaluator_user.txt")
+        user_content = [
+            {"type": "text", "text": user_prompt},
+            {"type": "image", "image": rgb_image},
+        ]
 
     # Build messages
     messages = [
@@ -236,10 +259,7 @@ def run_traversability_evaluator(
         },
         {
             "role": "user",
-            "content": [
-                {"type": "text", "text": user_prompt},
-                {"type": "image", "image": image},
-            ],
+            "content": user_content,
         },
     ]
 
@@ -295,6 +315,7 @@ def parse_evaluator_output(response: str) -> Dict:
 # Global model caches (loaded once, reused across images)
 _sam_cache = {"model": None, "processor": None, "loaded": False, "failed": False}
 _gdino_cache = {"model": None, "processor": None, "loaded": False, "failed": False}
+_sam3_cache = {"model": None, "processor": None, "loaded": False, "failed": False}
 
 
 def _load_sam_model(config: Dict):
@@ -352,6 +373,37 @@ def _load_grounding_dino_model(config: Dict):
     except Exception as e:
         logger.warning(f"Grounding-DINO model load failed ({e}), falling back to SAM-only")
         _gdino_cache["failed"] = True
+
+
+def _load_sam3_model(config: Dict):
+    """Load SAM3 model once and cache it globally.
+
+    SAM3 (facebook/sam3) is a text-prompted segmentation model (0.8B params).
+    It takes an image + text prompt and produces 200 query masks at 288×288.
+    The best mask is selected via score = pred_logits.sigmoid() * presence_logits.sigmoid().
+    """
+    if _sam3_cache["loaded"] or _sam3_cache["failed"]:
+        return
+
+    seg_config = config["model"].get("segmentation", {})
+    sam3_model_id = seg_config.get("sam3_model_id", "facebook/sam3")
+
+    try:
+        import torch
+        from transformers import Sam3Model, Sam3Processor
+
+        device = seg_config.get("device", "cuda")
+
+        logger.info(f"Loading SAM3 model: {sam3_model_id} (one-time load, 0.8B params)")
+        _sam3_cache["processor"] = Sam3Processor.from_pretrained(sam3_model_id)
+        _sam3_cache["model"] = Sam3Model.from_pretrained(
+            sam3_model_id, torch_dtype=torch.float16
+        ).to(device)
+        _sam3_cache["loaded"] = True
+        logger.info("SAM3 model loaded successfully")
+    except Exception as e:
+        logger.warning(f"SAM3 model load failed ({e}), will use bbox masks for all images")
+        _sam3_cache["failed"] = True
 
 
 def _build_gdino_prompt_from_vlm(areas: List[Dict], default_prompt: str) -> str:
@@ -507,6 +559,7 @@ def run_segmentation(
     """Stage 3: Segment free ground areas.
 
     Dispatches to the configured segmentation method:
+      - "sam3"           — VLM area descriptions → SAM3 text-prompted mask (recommended)
       - "sam"            — VLM bbox → SAM mask
       - "grounding_dino" — VLM area descriptions → Grounding-DINO bbox → SAM mask
       - "vlm_only"       — VLM bbox → rectangular mask
@@ -516,16 +569,20 @@ def run_segmentation(
         bboxes: List of bbox dicts from VLM reasoner with keys: x1, y1, x2, y2 (%).
         config: Pipeline config.
         vlm_areas: List of VLM-identified area dicts (with name, type, bbox, reasoning).
-                   Used to build Grounding-DINO text prompt following the LaC paper approach.
+                   Used to build text prompts for SAM3 and Grounding-DINO.
 
     Returns:
         Tuple of (masks, bboxes_used) where:
           - masks: list of binary numpy arrays
           - bboxes_used: list of bbox dicts (pixel coords for grounding_dino,
-                         percentage coords for sam/vlm_only)
+                         percentage coords for sam/vlm_only/sam3)
     """
     seg_config = config["model"].get("segmentation", {})
     method = seg_config.get("method", "vlm_only")
+
+    # ----- SAM3 method (VLM text → SAM3 mask) -----
+    if method == "sam3":
+        return _segment_with_sam3(rgb_image, vlm_areas or [], config)
 
     # ----- Grounding-DINO method -----
     if method == "grounding_dino":
@@ -715,6 +772,150 @@ def _run_sam_with_pixel_bboxes(
     except Exception as e:
         logger.warning(f"SAM segmentation with pixel bboxes failed ({e})")
         return []
+
+
+def _segment_with_sam3(
+    rgb_image: Image.Image,
+    vlm_areas: List[Dict],
+    config: Dict,
+) -> Tuple[List[np.ndarray], List[Dict]]:
+    """SAM3 text-prompted segmentation from VLM area descriptions.
+
+    Uses VLM-identified area names/types as text prompts for SAM3.
+    SAM3 produces 200 query masks per prompt; the best-scoring mask is
+    selected and resized to the original image dimensions.
+
+    This replaces Grounding-DINO + SAM with a single text-prompted
+    segmentation model, reducing over-segmentation by using VLM-derived
+    prompts directly.
+
+    Args:
+        rgb_image: Input RGB image.
+        vlm_areas: List of VLM-identified area dicts (with name, type, bbox, reasoning).
+        config: Pipeline config.
+
+    Returns:
+        Tuple of (masks, bboxes) where bboxes include a 'name' key for
+        area name tracking downstream.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    w, h = rgb_image.size
+
+    # Ensure model is loaded
+    if not _sam3_cache["loaded"] and not _sam3_cache["failed"]:
+        _load_sam3_model(config)
+
+    if _sam3_cache["failed"] or not _sam3_cache["loaded"]:
+        logger.warning("    SAM3 unavailable, falling back to VLM bbox masks")
+        vlm_bboxes = [a.get("bbox", {}) for a in vlm_areas if a.get("bbox")]
+        return bbox_to_masks(vlm_bboxes, rgb_image.size), vlm_bboxes
+
+    sam3_model = _sam3_cache["model"]
+    sam3_processor = _sam3_cache["processor"]
+    device = next(sam3_model.parameters()).device
+
+    seg_config = config["model"].get("segmentation", {})
+    mask_threshold = seg_config.get("sam3_mask_threshold", 0.5)
+
+    masks = []
+    bboxes = []
+
+    for area in vlm_areas:
+        # Build text prompt from VLM area description
+        name = area.get("name", "")
+        area_type = area.get("type", "")
+
+        # Use area name as prompt; fall back to type, then "floor"
+        if name:
+            text_prompt = name
+        elif area_type:
+            text_prompt = area_type.replace("_", " ")
+        else:
+            text_prompt = "floor"
+
+        logger.info(f"      SAM3 prompt: '{text_prompt}'")
+
+        try:
+            inputs = sam3_processor(
+                images=rgb_image,
+                text=text_prompt,
+                return_tensors="pt",
+            ).to(device)
+
+            with torch.no_grad():
+                outputs = sam3_model(**inputs)
+
+            # Score each of the 200 query masks
+            # pred_logits: (1, 200), presence_logits: (1, 200)
+            scores = (
+                outputs.pred_logits.sigmoid().squeeze(0)
+                * outputs.presence_logits.sigmoid().squeeze(0)
+            )
+            # scores shape: (200,)
+
+            best_idx = scores.argmax().item()
+            best_score = scores[best_idx].item()
+
+            # Get the best mask and resize to original image size
+            # pred_masks: (1, 200, 288, 288)
+            best_mask_logits = outputs.pred_masks[0, best_idx].unsqueeze(0).unsqueeze(0).float()
+            best_mask_probs = torch.sigmoid(best_mask_logits)
+            best_mask_resized = F.interpolate(
+                best_mask_probs, size=(h, w), mode="bilinear", align_corners=False,
+            )
+            best_mask = best_mask_resized.squeeze().cpu().numpy() > mask_threshold
+
+            # Skip empty / tiny masks
+            if best_mask.sum() < 100:
+                logger.info(
+                    f"      SAM3 mask for '{text_prompt}' too small "
+                    f"({best_mask.sum()} pixels), skipping"
+                )
+                continue
+
+            masks.append(best_mask)
+
+            # Compute bounding box from the mask (percentage coords)
+            ys, xs = np.where(best_mask)
+            bbox = {
+                "x1": round(int(xs.min()) / w * 100, 2),
+                "y1": round(int(ys.min()) / h * 100, 2),
+                "x2": round(int(xs.max()) / w * 100, 2),
+                "y2": round(int(ys.max()) / h * 100, 2),
+                "score": round(best_score, 4),
+                "source": "sam3",
+                "name": text_prompt,
+            }
+            bboxes.append(bbox)
+
+            coverage = best_mask.sum() / (h * w) * 100
+            logger.info(
+                f"      SAM3 mask for '{text_prompt}': score={best_score:.3f}, "
+                f"coverage={coverage:.1f}%"
+            )
+
+        except Exception as e:
+            logger.warning(f"      SAM3 failed for '{text_prompt}': {e}")
+            # Fall back to VLM bbox as rectangular mask
+            bbox = area.get("bbox", {})
+            if bbox and all(k in bbox for k in ["x1", "y1", "x2", "y2"]):
+                mask = np.zeros((h, w), dtype=bool)
+                x1 = int(bbox["x1"] / 100 * w)
+                y1 = int(bbox["y1"] / 100 * h)
+                x2 = int(bbox["x2"] / 100 * w)
+                y2 = int(bbox["y2"] / 100 * h)
+                mask[y1:y2, x1:x2] = True
+                masks.append(mask)
+                bboxes.append({**bbox, "source": "sam3_fallback", "name": text_prompt})
+
+    if not masks:
+        logger.warning("    SAM3 produced no valid masks, falling back to VLM bbox masks")
+        vlm_bboxes = [a.get("bbox", {}) for a in vlm_areas if a.get("bbox")]
+        return bbox_to_masks(vlm_bboxes, rgb_image.size), vlm_bboxes
+
+    return masks, bboxes
 
 
 def bbox_to_masks(bboxes: List[Dict], image_size: Tuple[int, int]) -> List[np.ndarray]:
@@ -916,7 +1117,7 @@ def process_single_image_lac(
     output_dir: Path,
 ) -> Dict:
     """Process a single image through the full LaC pipeline."""
-    input_mode = config["pipeline"].get("input_mode", "rgb_depth_overlay")
+    input_mode = config["pipeline"].get("input_mode", "rgb_depth_separate")
     seg_method = config["model"].get("segmentation", {}).get("method", "vlm_only")
     logger.info(f"Processing {folder_name}/{image_id} [LaC pipeline, mode={input_mode}, seg={seg_method}]")
 
@@ -999,14 +1200,18 @@ def process_single_image_lac(
             area_names.append(area.get("name", f"area_{len(vlm_bboxes)}"))
 
     if config["pipeline"].get("run_segmentation", True):
-        logger.info(f"  Stage 3: Segmentation — method={seg_method} ({len(vlm_bboxes)} VLM regions)...")
+        n_regions = len(filtered_areas) if seg_method == "sam3" else len(vlm_bboxes)
+        logger.info(f"  Stage 3: Segmentation — method={seg_method} ({n_regions} regions)...")
         t0 = time.time()
         masks, bboxes_used = run_segmentation(rgb_image, vlm_bboxes, config, vlm_areas=filtered_areas)
         t1 = time.time()
         logger.info(f"    Generated {len(masks)} masks ({t1-t0:.1f}s)")
 
-        # Generate area names for Grounding-DINO detections if they produced more masks
-        if len(masks) > len(area_names):
+        # For SAM3, extract area names from returned bboxes (which include 'name' key)
+        if seg_method == "sam3" and bboxes_used:
+            area_names = [b.get("name", f"sam3_area_{i}") for i, b in enumerate(bboxes_used)]
+        elif len(masks) > len(area_names):
+            # Generate area names for Grounding-DINO detections if they produced more masks
             for i in range(len(area_names), len(masks)):
                 area_names.append(f"gdino_region_{i}")
 
@@ -1106,7 +1311,7 @@ def run_lac_pipeline(config: Dict):
 
     # Setup output directory
     model_name = config["model"]["reasoner"]["name"]
-    input_mode = config["pipeline"].get("input_mode", "rgb_depth_overlay")
+    input_mode = config["pipeline"].get("input_mode", "rgb_depth_separate")
     seg_method = config["model"].get("segmentation", {}).get("method", "vlm_only")
     lac_suffix = config["pipeline"].get("output_suffix", "")
     lac_folder = f"{model_name}_LaC{lac_suffix}" if lac_suffix else f"{model_name}_LaC"
@@ -1144,9 +1349,12 @@ def run_lac_pipeline(config: Dict):
     else:
         evaluator_model, evaluator_processor = load_vlm_model(evaluator_config)
 
-    # Pre-load segmentation models (SAM / Grounding-DINO) — done once
+    # Pre-load segmentation models (SAM / SAM3 / Grounding-DINO) — done once
     seg_method = config["model"].get("segmentation", {}).get("method", "vlm_only")
-    if seg_method == "grounding_dino":
+    if seg_method == "sam3":
+        logger.info("Pre-loading SAM3 model...")
+        _load_sam3_model(config)
+    elif seg_method == "grounding_dino":
         logger.info("Pre-loading Grounding-DINO + SAM models...")
         _load_grounding_dino_model(config)
         _load_sam_model(config)
@@ -1170,6 +1378,14 @@ def run_lac_pipeline(config: Dict):
         pairs = filter_image_pairs(pairs, config, folder_name=folder.name)
 
         for i, (rgb_path, depth_path, image_id) in enumerate(pairs):
+            # ── Resume: skip images that already have results ──
+            existing_json = output_dir / folder.name / f"{image_id}_lac_analysis.json"
+            if existing_json.exists() and not config["pipeline"].get("clean_output", False):
+                logger.info(f"Processing {folder.name}/{image_id} [SKIPPED — already processed]")
+                with open(existing_json) as f:
+                    all_results.append(json.load(f))
+                continue
+
             try:
                 result = process_single_image_lac(
                     rgb_path=rgb_path,
@@ -1233,7 +1449,7 @@ def parse_args():
     )
     parser.add_argument(
         "--segmentation_method", type=str, default=None,
-        choices=["sam", "grounding_dino", "vlm_only"],
+        choices=["sam", "sam3", "grounding_dino", "vlm_only"],
         help="Override segmentation method",
     )
     parser.add_argument(
@@ -1246,8 +1462,9 @@ def parse_args():
     )
     parser.add_argument(
         "--input_mode", type=str, default=None,
-        choices=["rgb_only", "rgb_depth_overlay"],
-        help="Input mode for VLM",
+        choices=["rgb_only", "rgb_depth_separate"],
+        help="Input mode for VLM: rgb_only (single RGB), "
+             "rgb_depth_separate (RGB + depth as two separate images)",
     )
     parser.add_argument(
         "--specific_images", nargs="+", default=None,
@@ -1443,7 +1660,12 @@ def main():
     logger.info(f"Evaluator model: {config['model']['evaluator']['name']} "
                 f"({config['model']['evaluator']['hf_model_id']})")
     logger.info(f"Segmentation method: {seg_method}")
-    if seg_method == "grounding_dino":
+    if seg_method == "sam3":
+        sam3_id = config["model"]["segmentation"].get("sam3_model_id", "facebook/sam3")
+        sam3_thresh = config["model"]["segmentation"].get("sam3_mask_threshold", 0.5)
+        logger.info(f"  SAM3 model: {sam3_id}")
+        logger.info(f"  Mask threshold: {sam3_thresh}")
+    elif seg_method == "grounding_dino":
         gdino_id = config["model"]["segmentation"].get("grounding_dino_model_id", "N/A")
         gdino_prompt = config["model"]["segmentation"].get("grounding_dino_text_prompt", "N/A")
         gdino_box_th = config["model"]["segmentation"].get("grounding_dino_box_threshold", 0.3)
@@ -1453,7 +1675,7 @@ def main():
     elif seg_method == "sam":
         sam_id = config["model"]["segmentation"].get("sam_model_id", "N/A")
         logger.info(f"  SAM model: {sam_id}")
-    logger.info(f"Input mode: {config['pipeline'].get('input_mode', 'rgb_depth_overlay')}")
+    logger.info(f"Input mode: {config['pipeline'].get('input_mode', 'rgb_depth_separate')}")
     logger.info(f"Stages: reasoner={config['pipeline'].get('run_reasoner', True)}, "
                 f"evaluator={config['pipeline'].get('run_evaluator', True)}, "
                 f"segmentation={config['pipeline'].get('run_segmentation', True)}, "

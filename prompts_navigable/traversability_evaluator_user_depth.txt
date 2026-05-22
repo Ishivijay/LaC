@@ -1,0 +1,12 @@
+Evaluate the traversability of each identified free ground area.
+
+You are given TWO images:
+- Image 1 (left/top): The RGB photograph of the indoor scene.
+- Image 2 (right/bottom): A depth map where colors indicate distance from the camera. Cool colors (blue, cyan) = near, warm colors (yellow, red) = far. Uniform depth coloring indicates flat surfaces.
+
+Use the depth map (Image 2) to verify that each area is truly flat:
+- Flat floor: smooth, uniform depth coloring within the area
+- Stairs: distinct horizontal color bands (depth steps) within the area
+- Inclines: gradual but consistent color gradient (not flat)
+
+Output strictly in the specified JSON format.
