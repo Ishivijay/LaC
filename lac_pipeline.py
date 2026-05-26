@@ -1,29 +1,39 @@
 #!/usr/bin/env python3
-"""LaC-adapted Free Ground Space Detection Pipeline.
+"""Unified Free Ground Space Detection Pipeline
+================================================
 
-Based on "Language as Cost: Proactive Hazard Mapping using VLM for Robot Navigation"
-(Oh et al., IROS 2025). Adapted for free ground detection using local VLMs.
+Supports 4 strategies controlled by --strategy flag:
+  1. zero_shot : Single VLM (reasoner prompt) → SAM3
+  2. few_shot  : Single VLM (with example images) → SAM3
+  3. two_vlm   : Reasoner VLM + Evaluator VLM → SAM3
+                 (same or different models)
 
-Pipeline stages:
-  1. Free Ground Reasoner (VLM) — identifies flat floor areas with bounding boxes
-  2. Traversability Evaluator (VLM) — scores each area's walkability (1-3)
-  3. Segmentation — creates precise masks via SAM, SAM3, Grounding-DINO+SAM, or VLM bbox
-  4. Gaussian Cost Map — builds traversability map from masks + depth
-
-Segmentation methods (config: model.segmentation.method):
-  - "sam"            — VLM bbox percentages → SAM mask
-  - "sam3"           — VLM area descriptions → SAM3 text-prompted mask (recommended)
-  - "grounding_dino" — text prompt → Grounding-DINO detection → SAM mask
-  - "vlm_only"       — VLM bbox percentages → rectangular mask (no extra model)
+All strategies use SAM3 for segmentation and support:
+  - Input modes: rgb_only, rgb_depth_separate
+  - Models: Qwen2.5-VL-7B-Instruct, gemma-4-E4B-it
 
 Usage:
-    python3 lac_pipeline.py --config lac_config.yaml
-    python3 lac_pipeline.py --quick_test
-    python3 lac_pipeline.py --specific_images image28 image36 image188
-    python3 lac_pipeline.py --segmentation_method sam3
+    # Zero-shot
+    python lac_pipeline.py --strategy zero_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_only
+
+    # Few-shot
+    python lac_pipeline.py --strategy few_shot --model Qwen2.5-VL-7B-Instruct \\
+        --input_mode rgb_depth_separate --few_shot_dir /path/to/samples
+
+    # Two-VLM (same model)
+    python lac_pipeline.py --strategy two_vlm --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate
+
+    # Two-VLM (different models)
+    python lac_pipeline.py --strategy two_vlm \\
+        --reasoner_model Qwen2.5-VL-7B-Instruct --evaluator_model gemma-4-E4B-it \\
+        --input_mode rgb_depth_separate
+
+Output:
+    $WORK/free_ground_results/{strategy}/{model_tag}/{input_mode}_sam3/
 """
 
 import argparse
+import csv
 import json
 import logging
 import os
@@ -40,22 +50,12 @@ import yaml
 from PIL import Image
 
 # ---------------------------------------------------------------------------
-# Logging setup — dynamic model name resolved after config is loaded
+# Logging
 # ---------------------------------------------------------------------------
 
 _WORK_DIR = os.environ.get("WORK", str(Path(__file__).parent.parent))
-_LOG_MODEL_NAME = "LaC"  # overwritten in main() once config is known
+_LOG_MODEL_NAME = "pipeline"
 
-
-def _make_log_dir(model_name: str, suffix: str = "") -> Path:
-    """Create log directory under $WORK/free_ground_results/<model>_LaC<suffix>/logs/."""
-    lac_folder = f"{model_name}_LaC{suffix}" if suffix else f"{model_name}_LaC"
-    d = Path(_WORK_DIR) / "free_ground_results" / lac_folder / "logs"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-# Placeholder — real handlers are installed in main() after config is parsed
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -63,7 +63,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Add parent pipeline directory to path for shared utilities
+# Import shared utilities from free_ground_pipeline
 sys.path.insert(0, str(Path(__file__).parent.parent / "free_ground_pipeline"))
 from pipeline import (
     MODEL_REGISTRY,
@@ -75,25 +75,46 @@ from pipeline import (
     run_inference,
 )
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+SHORT_MODEL_NAMES = {
+    "Qwen2.5-VL-7B-Instruct": "Qwen",
+    "gemma-4-E4B-it": "Gemma",
+}
+
+STRATEGIES = ["zero_shot", "few_shot", "two_vlm"]
+INPUT_MODES = ["rgb_only", "rgb_depth_separate"]
+
+
+def _model_tag(strategy: str, reasoner_name: str, evaluator_name: str = None) -> str:
+    """Generate short model tag for output directory naming."""
+    r = SHORT_MODEL_NAMES.get(reasoner_name, reasoner_name)
+    if strategy == "two_vlm" and evaluator_name and evaluator_name != reasoner_name:
+        e = SHORT_MODEL_NAMES.get(evaluator_name, evaluator_name)
+        return f"{r}_{e}"
+    return r
+
 
 # ---------------------------------------------------------------------------
 # Prompt Loading
 # ---------------------------------------------------------------------------
 
-# Default prompt directory — can be overridden via --prompt_dir
-DEFAULT_PROMPT_DIR = Path(__file__).parent / "prompts"
+DEFAULT_PROMPT_DIR = Path(__file__).parent / "prompts_navigable"
 _active_prompt_dir = DEFAULT_PROMPT_DIR
 
 
 def set_prompt_dir(prompt_dir: Path):
-    """Set the active prompt directory (called from main() after arg parsing)."""
     global _active_prompt_dir
     _active_prompt_dir = prompt_dir
 
 
 def load_prompt(filename: str) -> str:
-    """Load a prompt template from the active prompts directory."""
     path = _active_prompt_dir / filename
+    if not path.exists():
+        # Fallback to default prompts
+        path = DEFAULT_PROMPT_DIR / filename
     if not path.exists():
         raise FileNotFoundError(f"Prompt file not found: {path}")
     with open(path) as f:
@@ -101,29 +122,18 @@ def load_prompt(filename: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Stage 1: Free Ground Reasoner
+# Stage 1: Free Ground Reasoner (used by zero_shot, few_shot, two_vlm)
 # ---------------------------------------------------------------------------
 
 def run_free_ground_reasoner(
-    model, processor, config: Dict, rgb_image: Image.Image, depth_image: Optional[Image.Image]
+    model, processor, config: Dict, rgb_image: Image.Image,
+    depth_image: Optional[Image.Image], model_config: Dict = None,
 ) -> Dict:
-    """Stage 1: Identify free ground areas with bounding boxes.
-
-    Uses the VLM to analyze the scene and output structured JSON
-    with free ground areas, bounding boxes, and reasoning.
-
-    Input modes:
-        - rgb_only:           Single RGB image
-        - rgb_depth_separate: RGB + depth as two separate images
-    """
+    """Run the reasoner VLM to identify free ground areas."""
     input_mode = config["pipeline"].get("input_mode", "rgb_depth_separate")
-
-    # Load prompts
     system_prompt = load_prompt("free_ground_reasoner_system.txt")
 
-    # Build user content based on input mode
     if input_mode == "rgb_depth_separate" and depth_image is not None:
-        # Two separate images: RGB + depth with explanatory prompt
         user_prompt = load_prompt("free_ground_reasoner_user_depth.txt")
         user_content = [
             {"type": "text", "text": user_prompt},
@@ -131,67 +141,45 @@ def run_free_ground_reasoner(
             {"type": "image", "image": depth_image},
         ]
     else:
-        # RGB only (or depth not available)
         user_prompt = load_prompt("free_ground_reasoner_user.txt")
         user_content = [
             {"type": "text", "text": user_prompt},
             {"type": "image", "image": rgb_image},
         ]
 
-    # Build messages
     messages = [
-        {
-            "role": "system",
-            "content": [{"type": "text", "text": system_prompt}],
-        },
-        {
-            "role": "user",
-            "content": user_content,
-        },
+        {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
+        {"role": "user", "content": user_content},
     ]
 
-    # Run inference — wrap in {"model": ...} since run_inference expects config["model"]
-    response = run_inference(model, processor, messages, {"model": config["model"]["reasoner"]})
+    mc = model_config or config["model"]["reasoner"]
+    response = run_inference(model, processor, messages, {"model": mc})
     return parse_reasoner_output(response)
 
 
 def parse_reasoner_output(response: str) -> Dict:
     """Parse the VLM reasoner output into structured data."""
-    # Clean response
     cleaned = re.sub(r"<think\b[^>]*>.*?</think?>", "", response, flags=re.DOTALL)
     cleaned = re.sub(r"```json\s*", "", cleaned)
     cleaned = re.sub(r"```", "", cleaned)
     cleaned = cleaned.strip()
 
-    # Try to parse as JSON
     try:
         result = json.loads(cleaned)
-        # VLM may return a list instead of dict — wrap it
         if isinstance(result, list):
-            logger.warning(f"Reasoner returned a list ({len(result)} items), wrapping as dict")
-            return {
-                "free_ground_areas": result,
-                "navigability_reasoning": "",
-                "obstacles": [],
-            }
+            return {"free_ground_areas": result, "navigability_reasoning": "", "obstacles": []}
         return result
     except json.JSONDecodeError:
-        # Try to find JSON in the response
         json_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if json_match:
             try:
                 result = json.loads(json_match.group())
                 if isinstance(result, list):
-                    return {
-                        "free_ground_areas": result,
-                        "navigability_reasoning": "",
-                        "obstacles": [],
-                    }
+                    return {"free_ground_areas": result, "navigability_reasoning": "", "obstacles": []}
                 return result
             except json.JSONDecodeError:
                 pass
 
-    # Fallback: return raw response
     return {
         "description": "",
         "free_ground_areas": [],
@@ -202,28 +190,18 @@ def parse_reasoner_output(response: str) -> Dict:
 
 
 # ---------------------------------------------------------------------------
-# Stage 2: Traversability Evaluator
+# Stage 2: Traversability Evaluator (used by two_vlm only)
 # ---------------------------------------------------------------------------
 
 def run_traversability_evaluator(
     model, processor, config: Dict, reasoner_output: Dict,
-    rgb_image: Image.Image, depth_image: Optional[Image.Image]
+    rgb_image: Image.Image, depth_image: Optional[Image.Image],
+    model_config: Dict = None,
 ) -> Dict:
-    """Stage 2: Evaluate traversability scores for each free ground area.
-
-    Adapted from LaC's Emotion Evaluator. Instead of anxiety scores,
-    assigns traversability scores (1-3) to each identified free ground area.
-
-    Input modes:
-        - rgb_only:           Single RGB image
-        - rgb_depth_separate: RGB + depth as two separate images
-    """
+    """Run the evaluator VLM to score traversability of each area."""
     input_mode = config["pipeline"].get("input_mode", "rgb_depth_separate")
-
-    # Load prompt template
     system_template = load_prompt("traversability_evaluator_system.txt")
 
-    # Fill in template
     free_ground_areas = reasoner_output.get("free_ground_areas", [])
     navigability_reasoning = reasoner_output.get("navigability_reasoning", "None")
 
@@ -234,9 +212,7 @@ def run_traversability_evaluator(
         "{navigability_reasoning}", str(navigability_reasoning)
     )
 
-    # Build user content based on input mode
     if input_mode == "rgb_depth_separate" and depth_image is not None:
-        # Two separate images: RGB + depth with explanatory prompt
         user_prompt = load_prompt("traversability_evaluator_user_depth.txt")
         user_content = [
             {"type": "text", "text": user_prompt},
@@ -244,27 +220,19 @@ def run_traversability_evaluator(
             {"type": "image", "image": depth_image},
         ]
     else:
-        # RGB only (or depth not available)
         user_prompt = load_prompt("traversability_evaluator_user.txt")
         user_content = [
             {"type": "text", "text": user_prompt},
             {"type": "image", "image": rgb_image},
         ]
 
-    # Build messages
     messages = [
-        {
-            "role": "system",
-            "content": [{"type": "text", "text": system_prompt}],
-        },
-        {
-            "role": "user",
-            "content": user_content,
-        },
+        {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
+        {"role": "user", "content": user_content},
     ]
 
-    # Run inference — wrap in {"model": ...} since run_inference expects config["model"]
-    response = run_inference(model, processor, messages, {"model": config["model"]["evaluator"]})
+    mc = model_config or config["model"]["evaluator"]
+    response = run_inference(model, processor, messages, {"model": mc})
     return parse_evaluator_output(response)
 
 
@@ -277,14 +245,9 @@ def parse_evaluator_output(response: str) -> Dict:
 
     try:
         result = json.loads(cleaned)
-        # VLM may return a list instead of dict — wrap it
         if isinstance(result, list):
-            logger.warning(f"Evaluator returned a list ({len(result)} items), wrapping as dict")
-            return {
-                "traversability_reasoning": "",
-                "traversability_score": {},
-                "raw_list_response": result,
-            }
+            return {"traversability_reasoning": "", "traversability_score": {},
+                    "raw_list_response": result}
         return result
     except json.JSONDecodeError:
         json_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
@@ -292,109 +255,245 @@ def parse_evaluator_output(response: str) -> Dict:
             try:
                 result = json.loads(json_match.group())
                 if isinstance(result, list):
-                    return {
-                        "traversability_reasoning": "",
-                        "traversability_score": {},
-                        "raw_list_response": result,
-                    }
+                    return {"traversability_reasoning": "", "traversability_score": {},
+                            "raw_list_response": result}
                 return result
             except json.JSONDecodeError:
                 pass
 
-    return {
-        "traversability_reasoning": {},
-        "traversability_score": {},
-        "raw_response": response,
+    return {"traversability_reasoning": {}, "traversability_score": {},
+            "raw_response": response}
+
+
+# ---------------------------------------------------------------------------
+# Few-Shot Support
+# ---------------------------------------------------------------------------
+
+def _analyze_mask_for_few_shot(mask_path: Path) -> Optional[Dict]:
+    """Analyze a binary mask to extract bbox and area info for few-shot examples."""
+    mask = np.array(Image.open(mask_path).convert("L"))
+    h, w = mask.shape
+    white = np.where(mask > 128)
+
+    if len(white[0]) == 0:
+        return None
+
+    y_min, y_max = white[0].min(), white[0].max()
+    x_min, x_max = white[1].min(), white[1].max()
+
+    bbox = {
+        "x1": round(x_min / w * 100, 1),
+        "y1": round(y_min / h * 100, 1),
+        "x2": round(x_max / w * 100, 1),
+        "y2": round(y_max / h * 100, 1),
     }
 
+    cx = (x_min + x_max) / 2 / w * 100
+    cy = (y_min + y_max) / 2 / h * 100
+    if cy > 66:
+        v_pos = "bottom"
+    elif cy > 33:
+        v_pos = "center"
+    else:
+        v_pos = "top"
+    if cx > 66:
+        h_pos = "right"
+    elif cx > 33:
+        h_pos = "center"
+    else:
+        h_pos = "left"
+    position = f"{v_pos}-{h_pos}"
+
+    area_pct = mask.sum() / 255 / (h * w) * 100
+    if area_pct > 30:
+        area_size = "large"
+    elif area_pct > 10:
+        area_size = "medium"
+    else:
+        area_size = "small"
+
+    return {"bbox": bbox, "position": position, "area_size": area_size}
+
+
+def _generate_few_shot_expected_output(analysis: Dict) -> Optional[str]:
+    """Generate expected JSON output for a few-shot example."""
+    bbox = analysis.get("bbox", {})
+    if not bbox:
+        return None
+    return json.dumps({
+        "free_ground_areas": [{
+            "name": "walkable floor area",
+            "type": "floor",
+            "bbox": bbox,
+            "reasoning": f"Flat navigable surface in {analysis.get('position', 'center')} of the image"
+        }],
+        "navigability_reasoning": "Clear walkable surface identified",
+        "obstacles": []
+    }, indent=2)
+
+
+def load_few_shot_samples(
+    few_shot_dir: str, data_dir: str, rgb_subfolder: str, depth_subfolder: str,
+    num_examples: int = 3,
+) -> Tuple[List[Dict], set]:
+    """Load few-shot sample images (RGB + depth + mask).
+
+    Discovers GT masks from few_shot_dir, then finds corresponding
+    RGB and depth images from data_dir.
+
+    Returns:
+        Tuple of (samples, used_keys) where used_keys is a set of
+        (folder_name, image_id) tuples that should be EXCLUDED from
+        the test set to prevent data leakage.
+
+    Args:
+        few_shot_dir: Directory with GT masks (subfolder format).
+        data_dir: Base data directory with RGB/depth images.
+        rgb_subfolder: Subfolder path for RGB images.
+        depth_subfolder: Subfolder path for depth images.
+        num_examples: Max number of examples to load.
+    """
+    gt_path = Path(few_shot_dir)
+    data_path = Path(data_dir)
+    samples = []
+    used_keys = set()  # Track (folder, image_id) used as examples
+
+    # Discover masks from subfolders — pick from DIFFERENT folders for diversity
+    for subfolder in sorted(gt_path.iterdir()):
+        if not subfolder.is_dir():
+            continue
+        if len(samples) >= num_examples:
+            break
+
+        folder_name = subfolder.name
+        for mask_file in sorted(subfolder.glob("*_mask.png")):
+            if len(samples) >= num_examples:
+                break
+
+            image_id = mask_file.stem.replace("_mask", "")
+            analysis = _analyze_mask_for_few_shot(mask_file)
+            if not analysis:
+                continue
+
+            expected_output = _generate_few_shot_expected_output(analysis)
+            if not expected_output:
+                continue
+
+            # Find RGB image
+            rgb_path = data_path / folder_name / rgb_subfolder / "PNG" / f"{image_id}.png"
+            if not rgb_path.exists():
+                rgb_path = data_path / folder_name / rgb_subfolder / f"{image_id}.png"
+            if not rgb_path.exists():
+                continue
+
+            # Find depth image
+            depth_path = data_path / folder_name / depth_subfolder / f"{image_id}_depth_colored.png"
+            if not depth_path.exists():
+                depth_path = data_path / folder_name / depth_subfolder / f"{image_id}.png"
+            depth_img = None
+            if depth_path.exists():
+                depth_img = Image.open(depth_path).convert("RGB")
+
+            # Track which images are used as examples (to exclude from test set)
+            used_keys.add((folder_name, image_id))
+
+            samples.append({
+                "name": f"{folder_name}/{image_id}",
+                "rgb_image": Image.open(rgb_path).convert("RGB"),
+                "depth_image": depth_img,
+                "expected_output": expected_output,
+            })
+
+    logger.info(f"Loaded {len(samples)} few-shot examples from {few_shot_dir}")
+    logger.info(f"  Example images (excluded from test): {used_keys}")
+    return samples, used_keys
+
+
+def build_few_shot_messages(
+    config: Dict, samples: List[Dict],
+    rgb_image: Image.Image, depth_image: Optional[Image.Image],
+) -> List[Dict]:
+    """Build chat messages with few-shot examples + query image.
+
+    Uses the reasoner system prompt with examples prepended.
+    The model is instructed to output JSON with free_ground_areas.
+    """
+    input_mode = config["pipeline"].get("input_mode", "rgb_depth_separate")
+
+    # System prompt (reasoner prompt + example instruction)
+    system_prompt = load_prompt("free_ground_reasoner_system.txt")
+    system_prompt += (
+        "\n\nYou will see EXAMPLE images with their correct analysis, "
+        "then a NEW image to analyze. "
+        "Output the same JSON format for the new image."
+    )
+
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
+    ]
+
+    # Add few-shot examples
+    for i, sample in enumerate(samples):
+        # User message with example images
+        example_content = [
+            {"type": "text", "text": f"EXAMPLE {i+1} — analyze this scene:"},
+        ]
+        if input_mode == "rgb_depth_separate" and sample.get("depth_image") is not None:
+            example_content.extend([
+                {"type": "image", "image": sample["rgb_image"]},
+                {"type": "image", "image": sample["depth_image"]},
+            ])
+        else:
+            example_content.append({"type": "image", "image": sample["rgb_image"]})
+
+        messages.append({"role": "user", "content": example_content})
+
+        # Assistant message with expected output
+        messages.append({
+            "role": "assistant",
+            "content": [{"type": "text", "text": sample["expected_output"]}],
+        })
+
+    # Query message
+    if input_mode == "rgb_depth_separate" and depth_image is not None:
+        user_prompt = load_prompt("free_ground_reasoner_user_depth.txt")
+        user_content = [
+            {"type": "text", "text": "Now analyze this NEW scene and identify all free navigable areas."},
+            {"type": "image", "image": rgb_image},
+            {"type": "image", "image": depth_image},
+        ]
+    else:
+        user_prompt = load_prompt("free_ground_reasoner_user.txt")
+        user_content = [
+            {"type": "text", "text": "Now analyze this NEW scene and identify all free navigable areas."},
+            {"type": "image", "image": rgb_image},
+        ]
+
+    messages.append({"role": "user", "content": user_content})
+    return messages
+
 
 # ---------------------------------------------------------------------------
-# Stage 3: Segmentation (SAM / Grounding-DINO+SAM / VLM-only)
+# Stage 3: SAM3 Segmentation
 # ---------------------------------------------------------------------------
 
-# Global model caches (loaded once, reused across images)
-_sam_cache = {"model": None, "processor": None, "loaded": False, "failed": False}
-_gdino_cache = {"model": None, "processor": None, "loaded": False, "failed": False}
 _sam3_cache = {"model": None, "processor": None, "loaded": False, "failed": False}
 
 
-def _load_sam_model(config: Dict):
-    """Load SAM model once and cache it globally."""
-    if _sam_cache["loaded"] or _sam_cache["failed"]:
-        return
-
-    seg_config = config["model"].get("segmentation", {})
-    method = seg_config.get("method", "vlm_only")
-
-    if method == "vlm_only":
-        _sam_cache["failed"] = True
-        return
-
-    try:
-        import torch
-        from transformers import SamModel, SamProcessor
-
-        device = seg_config.get("device", "cuda")
-        sam_model_id = seg_config.get("sam_model_id", "facebook/sam-vit-base")
-
-        logger.info(f"Loading SAM model: {sam_model_id} (one-time load)")
-        _sam_cache["model"] = SamModel.from_pretrained(sam_model_id).to(device)
-        _sam_cache["processor"] = SamProcessor.from_pretrained(sam_model_id)
-        _sam_cache["loaded"] = True
-        logger.info("SAM model loaded successfully")
-    except Exception as e:
-        logger.warning(f"SAM model load failed ({e}), will use bbox masks for all images")
-        _sam_cache["failed"] = True
-
-
-def _load_grounding_dino_model(config: Dict):
-    """Load Grounding-DINO model once and cache it globally."""
-    if _gdino_cache["loaded"] or _gdino_cache["failed"]:
-        return
-
-    seg_config = config["model"].get("segmentation", {})
-    gdino_model_id = seg_config.get(
-        "grounding_dino_model_id", "IDEA-Research/grounding-dino-tiny"
-    )
-
-    try:
-        import torch
-        from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
-
-        device = seg_config.get("device", "cuda")
-
-        logger.info(f"Loading Grounding-DINO model: {gdino_model_id} (one-time load)")
-        _gdino_cache["processor"] = AutoProcessor.from_pretrained(gdino_model_id)
-        _gdino_cache["model"] = AutoModelForZeroShotObjectDetection.from_pretrained(
-            gdino_model_id
-        ).to(device)
-        _gdino_cache["loaded"] = True
-        logger.info("Grounding-DINO model loaded successfully")
-    except Exception as e:
-        logger.warning(f"Grounding-DINO model load failed ({e}), falling back to SAM-only")
-        _gdino_cache["failed"] = True
-
-
 def _load_sam3_model(config: Dict):
-    """Load SAM3 model once and cache it globally.
-
-    SAM3 (facebook/sam3) is a text-prompted segmentation model (0.8B params).
-    It takes an image + text prompt and produces 200 query masks at 288×288.
-    The best mask is selected via score = pred_logits.sigmoid() * presence_logits.sigmoid().
-    """
+    """Load SAM3 model once and cache it globally."""
     if _sam3_cache["loaded"] or _sam3_cache["failed"]:
         return
 
+    import torch
+    from transformers import Sam3Model, Sam3Processor
+
     seg_config = config["model"].get("segmentation", {})
     sam3_model_id = seg_config.get("sam3_model_id", "facebook/sam3")
+    device = seg_config.get("device", "cuda")
 
     try:
-        import torch
-        from transformers import Sam3Model, Sam3Processor
-
-        device = seg_config.get("device", "cuda")
-
-        logger.info(f"Loading SAM3 model: {sam3_model_id} (one-time load, 0.8B params)")
+        logger.info(f"Loading SAM3 model: {sam3_model_id} (0.8B params)")
         _sam3_cache["processor"] = Sam3Processor.from_pretrained(sam3_model_id)
         _sam3_cache["model"] = Sam3Model.from_pretrained(
             sam3_model_id, torch_dtype=torch.float16
@@ -402,464 +501,57 @@ def _load_sam3_model(config: Dict):
         _sam3_cache["loaded"] = True
         logger.info("SAM3 model loaded successfully")
     except Exception as e:
-        logger.warning(f"SAM3 model load failed ({e}), will use bbox masks for all images")
+        logger.warning(f"SAM3 model load failed ({e}), will use bbox masks as fallback")
         _sam3_cache["failed"] = True
 
 
-def _build_gdino_prompt_from_vlm(areas: List[Dict], default_prompt: str) -> str:
-    """Build a Grounding-DINO text prompt from VLM-identified areas.
-
-    Follows the LaC paper approach: VLM output drives the segmentation model.
-    Extracts area names/types and converts them to Grounding-DINO format.
-    Falls back to default_prompt if VLM found no areas.
-    """
-    if not areas:
-        return default_prompt
-
-    # Collect unique terms from VLM area names and types
-    terms = set()
-    for area in areas:
-        name = area.get("name", "").lower()
-        area_type = area.get("type", "").lower()
-
-        # Add the type if available (e.g., "flat_floor", "stairs_up")
-        if area_type:
-            # Convert "flat_floor" → "floor", "stairs_up" → "stairs"
-            for part in area_type.replace("_", " ").split():
-                if part not in ("up", "down", "flat", "area", "surface"):
-                    terms.add(part)
-
-        # Extract key nouns from the name (e.g., "corridor floor" → "floor", "corridor")
-        skip_words = {"the", "a", "an", "of", "in", "on", "at", "to", "and", "area", "surface",
-                       "left", "right", "center", "bottom", "top", "side", "main", "small",
-                       "large", "wide", "narrow"}
-        for word in name.split():
-            w = word.strip(".,;:()").lower()
-            if w and w not in skip_words and len(w) > 2:
-                terms.add(w)
-
-    if not terms:
-        return default_prompt
-
-    # Build Grounding-DINO prompt: "term1 . term2 . term3 ."
-    prompt = " . ".join(sorted(terms)) + " ."
-    logger.info(f"    Built Grounding-DINO prompt from VLM areas: '{prompt}'")
-    return prompt
-
-
-def _run_grounding_dino_detection(
-    rgb_image: Image.Image,
-    config: Dict,
-    text_prompt_override: Optional[str] = None,
-) -> List[Dict]:
-    """Run Grounding-DINO on the image to detect floor/ground regions.
-
-    Args:
-        rgb_image: Input RGB image.
-        config: Pipeline config.
-        text_prompt_override: If provided, use this prompt instead of the config default.
-            This enables VLM-driven detection following the LaC paper approach.
-
-    Returns a list of bbox dicts with pixel coordinates:
-        [{"x1": int, "y1": int, "x2": int, "y2": int, "score": float}, ...]
-    """
-    seg_config = config["model"].get("segmentation", {})
-    default_prompt = seg_config.get("grounding_dino_text_prompt", "flat floor . floor . ground .")
-    text_prompt = text_prompt_override if text_prompt_override else default_prompt
-    box_threshold = seg_config.get("grounding_dino_box_threshold", 0.3)
-    text_threshold = seg_config.get("grounding_dino_text_threshold", 0.25)
-
-    # Ensure model is loaded
-    if not _gdino_cache["loaded"] and not _gdino_cache["failed"]:
-        _load_grounding_dino_model(config)
-
-    if _gdino_cache["failed"] or not _gdino_cache["loaded"]:
-        return []
-
-    try:
-        import torch
-
-        gdino_model = _gdino_cache["model"]
-        gdino_processor = _gdino_cache["processor"]
-        device = next(gdino_model.parameters()).device
-
-        # Prepare inputs
-        inputs = gdino_processor(
-            images=rgb_image,
-            text=text_prompt,
-            return_tensors="pt",
-        ).to(device)
-
-        with torch.no_grad():
-            outputs = gdino_model(**inputs)
-
-        # Post-process — get bounding boxes in pixel coordinates
-        w, h = rgb_image.size
-        target_sizes = torch.tensor([[h, w]])
-        try:
-            # Try new API (transformers >= 5.x — no threshold kwargs)
-            results = gdino_processor.post_process_grounded_object_detection(
-                outputs,
-                inputs["input_ids"],
-                target_sizes=target_sizes,
-            )[0]
-        except TypeError:
-            # Fallback: old API (transformers < 5.x — with threshold kwargs)
-            results = gdino_processor.post_process_grounded_object_detection(
-                outputs,
-                inputs["input_ids"],
-                target_sizes=target_sizes,
-                box_threshold=box_threshold,
-                text_threshold=text_threshold,
-            )[0]
-
-        # Extract boxes and scores
-        boxes = results["boxes"].cpu().numpy()  # (N, 4) — [x1, y1, x2, y2] pixel coords
-        scores = results["scores"].cpu().numpy()
-
-        # Apply thresholds manually if using new API (filter by score)
-        if scores.ndim > 0 and len(scores) > 0:
-            keep = scores >= box_threshold
-            boxes = boxes[keep]
-            scores = scores[keep]
-        labels = results.get("text_labels", results.get("labels", []))
-
-        detections = []
-        for i in range(len(boxes)):
-            x1, y1, x2, y2 = boxes[i]
-            # Clamp to image bounds
-            x1 = max(0, int(x1))
-            y1 = max(0, int(y1))
-            x2 = min(w, int(x2))
-            y2 = min(h, int(y2))
-            detections.append({
-                "x1": x1,
-                "y1": y1,
-                "x2": x2,
-                "y2": y2,
-                "score": float(scores[i]),
-                "label": labels[i] if i < len(labels) else "floor",
-            })
-
-        logger.info(f"    Grounding-DINO detected {len(detections)} regions "
-                     f"(prompt: '{text_prompt}', box_thresh={box_threshold})")
-        return detections
-
-    except Exception as e:
-        logger.warning(f"Grounding-DINO detection failed ({e})")
-        return []
-
-
-def run_segmentation(
-    rgb_image: Image.Image,
-    bboxes: List[Dict],
-    config: Dict,
-    vlm_areas: Optional[List[Dict]] = None,
-) -> Tuple[List[np.ndarray], List[Dict]]:
-    """Stage 3: Segment free ground areas.
-
-    Dispatches to the configured segmentation method:
-      - "sam3"           — VLM area descriptions → SAM3 text-prompted mask (recommended)
-      - "sam"            — VLM bbox → SAM mask
-      - "grounding_dino" — VLM area descriptions → Grounding-DINO bbox → SAM mask
-      - "vlm_only"       — VLM bbox → rectangular mask
-
-    Args:
-        rgb_image: Input RGB image.
-        bboxes: List of bbox dicts from VLM reasoner with keys: x1, y1, x2, y2 (%).
-        config: Pipeline config.
-        vlm_areas: List of VLM-identified area dicts (with name, type, bbox, reasoning).
-                   Used to build text prompts for SAM3 and Grounding-DINO.
-
-    Returns:
-        Tuple of (masks, bboxes_used) where:
-          - masks: list of binary numpy arrays
-          - bboxes_used: list of bbox dicts (pixel coords for grounding_dino,
-                         percentage coords for sam/vlm_only/sam3)
-    """
-    seg_config = config["model"].get("segmentation", {})
-    method = seg_config.get("method", "vlm_only")
-
-    # ----- SAM3 method (VLM text → SAM3 mask) -----
-    if method == "sam3":
-        return _segment_with_sam3(rgb_image, vlm_areas or [], config)
-
-    # ----- Grounding-DINO method -----
-    if method == "grounding_dino":
-        return _segment_with_grounding_dino(rgb_image, bboxes, config, vlm_areas=vlm_areas)
-
-    # ----- SAM method (VLM bbox → SAM) -----
-    if method == "sam":
-        masks = _segment_with_sam(rgb_image, bboxes, config)
-        return masks, bboxes
-
-    # ----- VLM-only fallback -----
-    return bbox_to_masks(bboxes, rgb_image.size), bboxes
-
-
-def _segment_with_grounding_dino(
-    rgb_image: Image.Image,
-    vlm_bboxes: List[Dict],
-    config: Dict,
-    vlm_areas: Optional[List[Dict]] = None,
-) -> Tuple[List[np.ndarray], List[Dict]]:
-    """Grounding-DINO detection → SAM segmentation.
-
-    Follows the LaC paper approach: VLM-identified areas drive the
-    Grounding-DINO text prompt. If the VLM found areas, their names/types
-    are converted to a detection prompt. If not, falls back to the default.
-
-    Then feeds Grounding-DINO pixel-accurate boxes to SAM for mask generation.
-    Falls back to VLM bboxes → SAM if Grounding-DINO fails.
-    """
-    w, h = rgb_image.size
-
-    # Build Grounding-DINO prompt from VLM areas (LaC paper approach)
-    seg_config = config["model"].get("segmentation", {})
-    default_prompt = seg_config.get("grounding_dino_text_prompt", "flat floor . floor . ground .")
-    gdino_prompt = _build_gdino_prompt_from_vlm(vlm_areas or [], default_prompt)
-
-    # Run Grounding-DINO detection with VLM-driven prompt
-    gdino_detections = _run_grounding_dino_detection(rgb_image, config, text_prompt_override=gdino_prompt)
-
-    if not gdino_detections:
-        logger.info("    Grounding-DINO found no detections, falling back to VLM bboxes → SAM")
-        masks = _segment_with_sam(rgb_image, vlm_bboxes, config)
-        return masks, vlm_bboxes
-
-    # Convert pixel-coordinate detections to percentage-based bboxes
-    # (so downstream code that expects percentages still works)
-    gdino_bboxes_pct = []
-    for det in gdino_detections:
-        gdino_bboxes_pct.append({
-            "x1": round(det["x1"] / w * 100, 2),
-            "y1": round(det["y1"] / h * 100, 2),
-            "x2": round(det["x2"] / w * 100, 2),
-            "y2": round(det["y2"] / h * 100, 2),
-            "score": det["score"],
-            "label": det.get("label", "floor"),
-        })
-
-    # Feed Grounding-DINO pixel bboxes to SAM for precise masks
-    # SAM expects pixel coords, so use the original detections
-    sam_bboxes = []
-    for det in gdino_detections:
-        sam_bboxes.append({
-            "x1": det["x1"],
-            "y1": det["y1"],
-            "x2": det["x2"],
-            "y2": det["y2"],
-        })
-
-    # Ensure SAM is loaded
-    if not _sam_cache["loaded"] and not _sam_cache["failed"]:
-        _load_sam_model(config)
-
-    if _sam_cache["loaded"]:
-        masks = _run_sam_with_pixel_bboxes(rgb_image, sam_bboxes)
-        if masks:
-            return masks, gdino_bboxes_pct
-
-    # SAM failed — use pixel bboxes as rectangular masks
-    logger.info("    SAM unavailable, using Grounding-DINO bboxes as rectangular masks")
-    masks = []
-    for det in gdino_detections:
-        mask = np.zeros((h, w), dtype=bool)
-        mask[det["y1"]:det["y2"], det["x1"]:det["x2"]] = True
-        masks.append(mask)
-    return masks, gdino_bboxes_pct
-
-
-def _segment_with_sam(
-    rgb_image: Image.Image,
-    bboxes: List[Dict],
-    config: Dict,
-) -> List[np.ndarray]:
-    """SAM segmentation from percentage-based VLM bboxes."""
-    if not bboxes:
-        return []
-
-    # Try to use cached SAM model
-    if _sam_cache["failed"]:
-        return bbox_to_masks(bboxes, rgb_image.size)
-
-    if not _sam_cache["loaded"]:
-        _load_sam_model(config)
-
-    if _sam_cache["failed"] or not _sam_cache["loaded"]:
-        return bbox_to_masks(bboxes, rgb_image.size)
-
-    try:
-        import torch
-
-        sam_model = _sam_cache["model"]
-        sam_processor = _sam_cache["processor"]
-        device = next(sam_model.parameters()).device
-
-        w, h = rgb_image.size
-        masks = []
-
-        for bbox in bboxes:
-            # Convert percentage bbox to pixel coordinates
-            x1 = int(bbox["x1"] / 100 * w)
-            y1 = int(bbox["y1"] / 100 * h)
-            x2 = int(bbox["x2"] / 100 * w)
-            y2 = int(bbox["y2"] / 100 * h)
-
-            # SAM expects [x1, y1, x2, y2] box prompt
-            inputs = sam_processor(
-                rgb_image,
-                input_boxes=[[[x1, y1, x2, y2]]],
-                return_tensors="pt"
-            ).to(device)
-
-            with torch.no_grad():
-                outputs = sam_model(**inputs, multimask_output=False)
-
-            mask = sam_processor.image_processor.post_process_masks(
-                outputs.pred_masks.cpu(),
-                inputs["original_sizes"].cpu(),
-                inputs["reshaped_input_sizes"].cpu(),
-            )[0][0][0].numpy()
-
-            masks.append(mask > 0)
-
-        return masks
-
-    except Exception as e:
-        logger.warning(f"SAM segmentation failed ({e}), falling back to bbox masks")
-        return bbox_to_masks(bboxes, rgb_image.size)
-
-
-def _run_sam_with_pixel_bboxes(
-    rgb_image: Image.Image,
-    pixel_bboxes: List[Dict],
-) -> List[np.ndarray]:
-    """Run SAM with pixel-coordinate bounding boxes (from Grounding-DINO)."""
-    if not _sam_cache["loaded"]:
-        return []
-
-    try:
-        import torch
-
-        sam_model = _sam_cache["model"]
-        sam_processor = _sam_cache["processor"]
-        device = next(sam_model.parameters()).device
-
-        masks = []
-        for bbox in pixel_bboxes:
-            x1, y1, x2, y2 = bbox["x1"], bbox["y1"], bbox["x2"], bbox["y2"]
-
-            inputs = sam_processor(
-                rgb_image,
-                input_boxes=[[[x1, y1, x2, y2]]],
-                return_tensors="pt"
-            ).to(device)
-
-            with torch.no_grad():
-                outputs = sam_model(**inputs, multimask_output=False)
-
-            mask = sam_processor.image_processor.post_process_masks(
-                outputs.pred_masks.cpu(),
-                inputs["original_sizes"].cpu(),
-                inputs["reshaped_input_sizes"].cpu(),
-            )[0][0][0].numpy()
-
-            masks.append(mask > 0)
-
-        return masks
-
-    except Exception as e:
-        logger.warning(f"SAM segmentation with pixel bboxes failed ({e})")
-        return []
-
-
 def _segment_with_sam3(
-    rgb_image: Image.Image,
-    vlm_areas: List[Dict],
-    config: Dict,
+    rgb_image: Image.Image, vlm_areas: List[Dict], config: Dict,
 ) -> Tuple[List[np.ndarray], List[Dict]]:
-    """SAM3 text-prompted segmentation from VLM area descriptions.
-
-    Uses VLM-identified area names/types as text prompts for SAM3.
-    SAM3 produces 200 query masks per prompt; the best-scoring mask is
-    selected and resized to the original image dimensions.
-
-    This replaces Grounding-DINO + SAM with a single text-prompted
-    segmentation model, reducing over-segmentation by using VLM-derived
-    prompts directly.
-
-    Args:
-        rgb_image: Input RGB image.
-        vlm_areas: List of VLM-identified area dicts (with name, type, bbox, reasoning).
-        config: Pipeline config.
-
-    Returns:
-        Tuple of (masks, bboxes) where bboxes include a 'name' key for
-        area name tracking downstream.
-    """
+    """SAM3 text-prompted segmentation from VLM area descriptions."""
     import torch
     import torch.nn.functional as F
 
     w, h = rgb_image.size
 
-    # Ensure model is loaded
     if not _sam3_cache["loaded"] and not _sam3_cache["failed"]:
         _load_sam3_model(config)
 
     if _sam3_cache["failed"] or not _sam3_cache["loaded"]:
-        logger.warning("    SAM3 unavailable, falling back to VLM bbox masks")
+        logger.warning("    SAM3 unavailable, falling back to bbox masks")
         vlm_bboxes = [a.get("bbox", {}) for a in vlm_areas if a.get("bbox")]
-        return bbox_to_masks(vlm_bboxes, rgb_image.size), vlm_bboxes
+        return _bbox_to_masks(vlm_bboxes, rgb_image.size), vlm_bboxes
 
     sam3_model = _sam3_cache["model"]
     sam3_processor = _sam3_cache["processor"]
     device = next(sam3_model.parameters()).device
-
-    seg_config = config["model"].get("segmentation", {})
-    mask_threshold = seg_config.get("sam3_mask_threshold", 0.5)
+    mask_threshold = config["model"].get("segmentation", {}).get("sam3_mask_threshold", 0.5)
 
     masks = []
     bboxes = []
 
     for area in vlm_areas:
-        # Build text prompt from VLM area description
         name = area.get("name", "")
         area_type = area.get("type", "")
-
-        # Use area name as prompt; fall back to type, then "floor"
-        if name:
-            text_prompt = name
-        elif area_type:
-            text_prompt = area_type.replace("_", " ")
-        else:
-            text_prompt = "floor"
+        text_prompt = name or area_type.replace("_", " ") or "floor"
 
         logger.info(f"      SAM3 prompt: '{text_prompt}'")
 
         try:
             inputs = sam3_processor(
-                images=rgb_image,
-                text=text_prompt,
-                return_tensors="pt",
+                images=rgb_image, text=text_prompt, return_tensors="pt",
             ).to(device)
 
             with torch.no_grad():
                 outputs = sam3_model(**inputs)
 
-            # Score each of the 200 query masks
-            # pred_logits: (1, 200), presence_logits: (1, 200)
             scores = (
                 outputs.pred_logits.sigmoid().squeeze(0)
                 * outputs.presence_logits.sigmoid().squeeze(0)
             )
-            # scores shape: (200,)
-
             best_idx = scores.argmax().item()
             best_score = scores[best_idx].item()
 
-            # Get the best mask and resize to original image size
-            # pred_masks: (1, 200, 288, 288)
             best_mask_logits = outputs.pred_masks[0, best_idx].unsqueeze(0).unsqueeze(0).float()
             best_mask_probs = torch.sigmoid(best_mask_logits)
             best_mask_resized = F.interpolate(
@@ -867,19 +559,13 @@ def _segment_with_sam3(
             )
             best_mask = best_mask_resized.squeeze().cpu().numpy() > mask_threshold
 
-            # Skip empty / tiny masks
             if best_mask.sum() < 100:
-                logger.info(
-                    f"      SAM3 mask for '{text_prompt}' too small "
-                    f"({best_mask.sum()} pixels), skipping"
-                )
+                logger.info(f"      SAM3 mask for '{text_prompt}' too small, skipping")
                 continue
 
             masks.append(best_mask)
-
-            # Compute bounding box from the mask (percentage coords)
             ys, xs = np.where(best_mask)
-            bbox = {
+            bboxes.append({
                 "x1": round(int(xs.min()) / w * 100, 2),
                 "y1": round(int(ys.min()) / h * 100, 2),
                 "x2": round(int(xs.max()) / w * 100, 2),
@@ -887,18 +573,13 @@ def _segment_with_sam3(
                 "score": round(best_score, 4),
                 "source": "sam3",
                 "name": text_prompt,
-            }
-            bboxes.append(bbox)
+            })
 
             coverage = best_mask.sum() / (h * w) * 100
-            logger.info(
-                f"      SAM3 mask for '{text_prompt}': score={best_score:.3f}, "
-                f"coverage={coverage:.1f}%"
-            )
+            logger.info(f"      SAM3: '{text_prompt}' score={best_score:.3f} coverage={coverage:.1f}%")
 
         except Exception as e:
             logger.warning(f"      SAM3 failed for '{text_prompt}': {e}")
-            # Fall back to VLM bbox as rectangular mask
             bbox = area.get("bbox", {})
             if bbox and all(k in bbox for k in ["x1", "y1", "x2", "y2"]):
                 mask = np.zeros((h, w), dtype=bool)
@@ -911,15 +592,15 @@ def _segment_with_sam3(
                 bboxes.append({**bbox, "source": "sam3_fallback", "name": text_prompt})
 
     if not masks:
-        logger.warning("    SAM3 produced no valid masks, falling back to VLM bbox masks")
+        logger.warning("    SAM3 produced no valid masks, falling back to bbox masks")
         vlm_bboxes = [a.get("bbox", {}) for a in vlm_areas if a.get("bbox")]
-        return bbox_to_masks(vlm_bboxes, rgb_image.size), vlm_bboxes
+        return _bbox_to_masks(vlm_bboxes, rgb_image.size), vlm_bboxes
 
     return masks, bboxes
 
 
-def bbox_to_masks(bboxes: List[Dict], image_size: Tuple[int, int]) -> List[np.ndarray]:
-    """Convert bounding box percentages to binary masks."""
+def _bbox_to_masks(bboxes: List[Dict], image_size: Tuple[int, int]) -> List[np.ndarray]:
+    """Convert bounding box percentages to binary masks (fallback)."""
     w, h = image_size
     masks = []
     for bbox in bboxes:
@@ -934,83 +615,21 @@ def bbox_to_masks(bboxes: List[Dict], image_size: Tuple[int, int]) -> List[np.nd
 
 
 # ---------------------------------------------------------------------------
-# Stage 4: Gaussian Cost Map
+# Mask Saving
 # ---------------------------------------------------------------------------
 
-def build_cost_map(
-    masks: List[np.ndarray],
-    scores: Dict[str, int],
-    area_names: List[str],
-    image_size: Tuple[int, int],
-    config: Dict,
-) -> np.ndarray:
-    """Build a Gaussian traversability cost map from segmented areas.
-
-    Adapted from LaC's Gaussian cost map. Instead of anxiety-based hazard costs,
-    this creates a traversability map where:
-    - Free ground areas get LOW cost (safe to traverse)
-    - Obstacles/unknown areas get HIGH cost (avoid)
-    - Gaussian smoothing creates natural gradients
-
-    Args:
-        masks: List of binary masks for each free ground area.
-        scores: Dict mapping area_name → traversability score (1-3).
-        area_names: List of area names corresponding to masks.
-        image_size: (width, height) of the image.
-        config: Pipeline config.
-
-    Returns:
-        Cost map as numpy array (H, W) with values in [0, 1].
-        0 = safe (free ground), 1 = obstacle/unknown.
-    """
-    cm_config = config.get("cost_map", {})
-    sigma_base = cm_config.get("sigma_base", 0.3)
-
-    w, h = image_size
-    cost_map = np.ones((h, w), dtype=np.float32)  # Start with all obstacles
-
-    from scipy.ndimage import gaussian_filter
-
-    for i, (mask, name) in enumerate(zip(masks, area_names)):
-        score = scores.get(name, 2)  # Default moderate traversability
-
-        # Score 0 = NOT traversable (stairs, inclines) — treat as obstacle
-        if score == 0:
-            logger.info(f"    Area '{name}' scored 0 (not traversable), treating as obstacle")
-            continue
-
-        # Higher score = more traversable = lower cost
-        # Score 3 → cost 0.1, Score 2 → cost 0.3, Score 1 → cost 0.6
-        area_cost = max(0.0, 1.0 - (score / 3.0))
-
-        # Apply mask
-        cost_map[mask] = area_cost
-
-        # Gaussian smoothing around the mask boundary
-        # Higher traversability → wider safe zone (larger sigma)
-        sigma = sigma_base * score
-        smoothed = gaussian_filter(cost_map, sigma=sigma)
-
-        # Only apply smoothing where it reduces cost (don't spread obstacles)
-        cost_map = np.minimum(cost_map, smoothed)
-
-    return np.clip(cost_map, 0, 1)
-
-
 def save_segmentation_masks(
-    masks: List[np.ndarray],
-    area_names: List[str],
-    rgb_image: Image.Image,
-    bboxes: List[Dict],
-    output_dir: Path,
-    image_id: str,
+    masks: List[np.ndarray], area_names: List[str],
+    rgb_image: Image.Image, bboxes: List[Dict],
+    output_dir: Path, image_id: str,
+    depth_image: Image.Image = None,
+    input_mode: str = "rgb_only",
 ):
-    """Save segmentation masks as individual PNGs, NPYs, and an overlay visualization.
+    """Save segmentation masks as PNGs + overlay + consolidated visualization.
 
-    Saves:
-      - masks/{image_id}_mask_{i}_{name}.png  — binary mask
-      - masks/{image_id}_mask_{i}_{name}.npy  — raw numpy array
-      - masks/{image_id}_segmentation_overlay.png — all masks overlaid on RGB
+    Consolidated image layout:
+      rgb_only:         [Original RGB] | [Segmentation Overlay]
+      rgb_depth_separate: [Original RGB] | [Depth Map] | [Segmentation Overlay]
     """
     mask_dir = output_dir / "masks"
     mask_dir.mkdir(parents=True, exist_ok=True)
@@ -1018,108 +637,93 @@ def save_segmentation_masks(
     rgb_array = np.array(rgb_image.convert("RGB"))
     overlay = rgb_array.copy()
 
-    # Distinct colors for different areas
     colors = [
-        (0, 255, 0),    # green
-        (0, 128, 255),  # orange-blue
-        (255, 0, 255),  # magenta
-        (255, 255, 0),  # yellow
-        (0, 255, 255),  # cyan
-        (255, 128, 0),  # orange
+        (0, 255, 0), (0, 128, 255), (255, 0, 255),
+        (255, 255, 0), (0, 255, 255), (255, 128, 0),
     ]
 
     for i, (mask, name) in enumerate(zip(masks, area_names)):
         safe_name = re.sub(r'[^\w]', '_', name)[:30]
         base = f"{image_id}_mask_{i}_{safe_name}"
 
-        # Save binary mask as PNG
         mask_img = Image.fromarray((mask * 255).astype(np.uint8))
         mask_img.save(mask_dir / f"{base}.png")
-
-        # Save raw numpy array
         np.save(mask_dir / f"{base}.npy", mask)
 
-        # Add colored overlay
         color = colors[i % len(colors)]
-        colored = np.zeros_like(rgb_array)
-        for c in range(3):
-            colored[:, :, c] = mask * color[c]
-        overlay = np.where(mask[:, :, np.newaxis] > 0,
-                           (overlay * 0.5 + colored * 0.5).astype(np.uint8),
-                           overlay)
+        color_mask = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
+        color_mask[mask] = color
+        overlay[mask] = (overlay[mask] * 0.5 + color_mask[mask] * 0.5).astype(np.uint8)
 
-        # Draw bbox rectangle
-        if i < len(bboxes):
-            bbox = bboxes[i]
-            x1 = int(bbox.get("x1", 0) * rgb_image.width / 100
-                     if bbox.get("x1", 0) <= 100 else bbox.get("x1", 0))
-            y1 = int(bbox.get("y1", 0) * rgb_image.height / 100
-                     if bbox.get("y1", 0) <= 100 else bbox.get("y1", 0))
-            x2 = int(bbox.get("x2", 100) * rgb_image.width / 100
-                     if bbox.get("x2", 100) <= 100 else bbox.get("x2", 100))
-            y2 = int(bbox.get("y2", 100) * rgb_image.height / 100
-                     if bbox.get("y2", 100) <= 100 else bbox.get("y2", 100))
-            overlay[y1:y1+2, x1:x2] = color
-            overlay[y2:y2+2, x1:x2] = color
-            overlay[y1:y2, x1:x1+2] = color
-            overlay[y1:y2, x2:x2+2] = color
-
-    # Save overlay
     Image.fromarray(overlay).save(mask_dir / f"{image_id}_segmentation_overlay.png")
-    logger.info(f"    Saved {len(masks)} masks + overlay to masks/")
 
+    # ── Consolidated visualization ─────────────────────────────────────────
+    h, w = rgb_array.shape[:2]
+    label_h = 30  # height for text label above each panel
+    gap = 4       # pixel gap between panels
 
-def visualize_cost_map(cost_map: np.ndarray, rgb_image: Image.Image, output_path: Path):
-    """Create a visualization of the cost map overlaid on the RGB image."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    panels = []
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    # Panel 1: Original RGB
+    panels.append(("Original RGB", rgb_array))
 
-    # Original image
-    axes[0].imshow(np.array(rgb_image))
-    axes[0].set_title("RGB Image")
-    axes[0].axis("off")
+    # Panel 2: Depth map (if available)
+    if input_mode != "rgb_only" and depth_image is not None:
+        depth_rgb = np.array(depth_image.convert("RGB"))
+        # Resize to match RGB if needed
+        if depth_rgb.shape[:2] != (h, w):
+            depth_rgb = np.array(depth_image.convert("RGB").resize((w, h), Image.NEAREST))
+        panels.append(("Depth Map", depth_rgb))
 
-    # Cost map
-    im = axes[1].imshow(cost_map, cmap="RdYlGn_r", vmin=0, vmax=1)
-    axes[1].set_title("Traversability Cost Map")
-    axes[1].axis("off")
-    plt.colorbar(im, ax=axes[1], label="Cost (0=safe, 1=obstacle)")
+    # Panel 3: Segmentation overlay
+    panels.append(("Segmentation", overlay))
 
-    # Overlay
-    overlay = np.array(rgb_image).copy()
-    cost_colored = plt.cm.RdYlGn_r(cost_map)[:, :, :3]
-    overlay = (overlay * 0.6 + cost_colored * 255 * 0.4).astype(np.uint8)
-    axes[2].imshow(overlay)
-    axes[2].set_title("Cost Map Overlay")
-    axes[2].axis("off")
+    # Build consolidated image with labels
+    total_w = sum(p.shape[1] for p in panels) + gap * (len(panels) - 1)
+    total_h = h + label_h
+    consolidated = np.full((total_h, total_w, 3), 255, dtype=np.uint8)
 
-    plt.tight_layout()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close()
+    x_offset = 0
+    for label, panel in panels:
+        # Draw label background
+        consolidated[0:label_h, x_offset:x_offset + panel.shape[1]] = (40, 40, 40)
+        # Draw label text using PIL
+        label_img = Image.fromarray(consolidated)
+        from PIL import ImageDraw, ImageFont
+        draw = ImageDraw.Draw(label_img)
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
+        except (OSError, IOError):
+            font = ImageFont.load_default()
+        text_x = x_offset + (panel.shape[1] - draw.textlength(label, font=font)) // 2
+        draw.text((text_x, 5), label, fill=(255, 255, 255), font=font)
+        consolidated = np.array(label_img)
+
+        # Paste panel below label
+        consolidated[label_h:label_h + h, x_offset:x_offset + panel.shape[1]] = panel
+        x_offset += panel.shape[1] + gap
+
+    consolidated_path = output_dir / f"{image_id}_consolidated.png"
+    Image.fromarray(consolidated).save(consolidated_path)
+    logger.debug(f"    Saved consolidated visualization: {consolidated_path.name}")
 
 
 # ---------------------------------------------------------------------------
-# Main Pipeline
+# Single Image Processing
 # ---------------------------------------------------------------------------
 
-def process_single_image_lac(
-    rgb_path: Path,
-    depth_path: Path,
-    image_id: str,
-    folder_name: str,
-    reasoner_model, reasoner_processor,
-    evaluator_model, evaluator_processor,
-    config: Dict,
-    output_dir: Path,
+def process_single_image(
+    rgb_path: Path, depth_path: Path, image_id: str, folder_name: str,
+    models: Dict, config: Dict, output_dir: Path,
+    few_shot_samples: List[Dict] = None,
 ) -> Dict:
-    """Process a single image through the full LaC pipeline."""
+    """Process a single image through the pipeline.
+
+    Dispatches to strategy-specific VLM processing, then runs SAM3.
+    """
+    strategy = config["pipeline"]["strategy"]
     input_mode = config["pipeline"].get("input_mode", "rgb_depth_separate")
-    seg_method = config["model"].get("segmentation", {}).get("method", "vlm_only")
-    logger.info(f"Processing {folder_name}/{image_id} [LaC pipeline, mode={input_mode}, seg={seg_method}]")
+    logger.info(f"Processing {folder_name}/{image_id} [strategy={strategy}, mode={input_mode}]")
 
     # Load images
     rgb_image = load_image_for_vlm(rgb_path)
@@ -1130,192 +734,179 @@ def process_single_image_lac(
     result = {
         "folder": folder_name,
         "image_id": image_id,
-        "pipeline": "LaC",
+        "strategy": strategy,
         "input_mode": input_mode,
-        "segmentation_method": seg_method,
+        "segmentation_method": "sam3",
         "timestamp": datetime.now().isoformat(),
     }
 
-    # ---- Stage 1: Free Ground Reasoner ----
-    if config["pipeline"].get("run_reasoner", True):
-        logger.info("  Stage 1: Free Ground Reasoner...")
+    # ── Stage 1: VLM processing (strategy-dependent) ──────────────────────
+    areas = []
+    evaluator_output = None
+
+    if strategy == "zero_shot":
+        # Single VLM with reasoner prompt
+        logger.info("  Stage 1: Zero-shot Reasoner...")
         t0 = time.time()
         reasoner_output = run_free_ground_reasoner(
-            reasoner_model, reasoner_processor, config, rgb_image, depth_image
+            models["reasoner"][0], models["reasoner"][1],
+            config, rgb_image, depth_image,
         )
         t1 = time.time()
         areas = reasoner_output.get("free_ground_areas", [])
-        logger.info(f"    Found {len(areas)} free ground areas ({t1-t0:.1f}s)")
+        logger.info(f"    Found {len(areas)} areas ({t1-t0:.1f}s)")
         result["reasoner"] = {
             "output": reasoner_output,
             "inference_time": round(t1 - t0, 2),
             "num_areas": len(areas),
         }
-    else:
-        reasoner_output = {"free_ground_areas": [], "navigability_reasoning": ""}
-        result["reasoner"] = {"output": reasoner_output, "skipped": True}
 
-    # ---- Stage 2: Traversability Evaluator ----
-    areas = reasoner_output.get("free_ground_areas", [])
-    if config["pipeline"].get("run_evaluator", True) and areas:
-        logger.info("  Stage 2: Traversability Evaluator...")
+    elif strategy == "few_shot":
+        # Single VLM with few-shot examples
+        logger.info(f"  Stage 1: Few-shot Reasoner ({len(few_shot_samples)} examples)...")
         t0 = time.time()
-        evaluator_output = run_traversability_evaluator(
-            evaluator_model, evaluator_processor, config,
-            reasoner_output, rgb_image, depth_image
+        messages = build_few_shot_messages(
+            config, few_shot_samples, rgb_image, depth_image,
+        )
+        response = run_inference(
+            models["reasoner"][0], models["reasoner"][1],
+            messages, {"model": config["model"]["reasoner"]},
+        )
+        reasoner_output = parse_reasoner_output(response)
+        t1 = time.time()
+        areas = reasoner_output.get("free_ground_areas", [])
+        logger.info(f"    Found {len(areas)} areas ({t1-t0:.1f}s)")
+        result["reasoner"] = {
+            "output": reasoner_output,
+            "inference_time": round(t1 - t0, 2),
+            "num_areas": len(areas),
+            "num_examples": len(few_shot_samples),
+        }
+
+    elif strategy == "two_vlm":
+        # Reasoner VLM
+        logger.info("  Stage 1: Reasoner VLM...")
+        t0 = time.time()
+        reasoner_output = run_free_ground_reasoner(
+            models["reasoner"][0], models["reasoner"][1],
+            config, rgb_image, depth_image,
         )
         t1 = time.time()
-        scores = evaluator_output.get("traversability_score", {})
-        logger.info(f"    Scores: {scores} ({t1-t0:.1f}s)")
-        result["evaluator"] = {
-            "output": evaluator_output,
+        areas = reasoner_output.get("free_ground_areas", [])
+        logger.info(f"    Found {len(areas)} areas ({t1-t0:.1f}s)")
+        result["reasoner"] = {
+            "output": reasoner_output,
             "inference_time": round(t1 - t0, 2),
+            "num_areas": len(areas),
         }
-    else:
-        evaluator_output = {"traversability_score": {}}
-        result["evaluator"] = {"output": evaluator_output, "skipped": True}
 
-    # ---- Stage 2.5: Filter score=0 areas (non-traversable) ----
-    scores = evaluator_output.get("traversability_score", {})
-    filtered_areas = []
-    for area in areas:
-        name = area.get("name", "")
-        score = scores.get(name, None)
-        if score == 0:
-            logger.info(f"    Filtering out '{name}' (score=0, non-traversable)")
-            continue
-        filtered_areas.append(area)
+        # Evaluator VLM
+        if areas:
+            logger.info("  Stage 2: Evaluator VLM...")
+            t0 = time.time()
+            evaluator_output = run_traversability_evaluator(
+                models["evaluator"][0], models["evaluator"][1],
+                config, reasoner_output, rgb_image, depth_image,
+            )
+            t1 = time.time()
+            scores = evaluator_output.get("traversability_score", {})
+            logger.info(f"    Scores: {scores} ({t1-t0:.1f}s)")
+            result["evaluator"] = {
+                "output": evaluator_output,
+                "inference_time": round(t1 - t0, 2),
+            }
 
-    if len(filtered_areas) < len(areas):
-        logger.info(f"    Kept {len(filtered_areas)}/{len(areas)} areas after score filtering")
+            # Filter score=0 areas
+            filtered = []
+            for area in areas:
+                name = area.get("name", "")
+                score = scores.get(name, None)
+                if score == 0:
+                    logger.info(f"    Filtering '{name}' (score=0)")
+                    continue
+                filtered.append(area)
+            if len(filtered) < len(areas):
+                logger.info(f"    Kept {len(filtered)}/{len(areas)} after score filtering")
+            areas = filtered
+        else:
+            result["evaluator"] = {"output": {}, "skipped": True}
 
-    # ---- Stage 3: Segmentation ----
-    # Collect VLM bboxes (percentage-based) for the filtered areas
-    vlm_bboxes = []
-    area_names = []
-    for area in filtered_areas:
-        bbox = area.get("bbox", {})
-        if bbox and all(k in bbox for k in ["x1", "y1", "x2", "y2"]):
-            vlm_bboxes.append(bbox)
-            area_names.append(area.get("name", f"area_{len(vlm_bboxes)}"))
+    # ── Stage 3: SAM3 Segmentation ────────────────────────────────────────
+    logger.info(f"  Stage 3: SAM3 Segmentation ({len(areas)} regions)...")
+    t0 = time.time()
+    masks, bboxes_used = _segment_with_sam3(rgb_image, areas, config)
+    t1 = time.time()
+    logger.info(f"    Generated {len(masks)} masks ({t1-t0:.1f}s)")
 
-    if config["pipeline"].get("run_segmentation", True):
-        n_regions = len(filtered_areas) if seg_method == "sam3" else len(vlm_bboxes)
-        logger.info(f"  Stage 3: Segmentation — method={seg_method} ({n_regions} regions)...")
-        t0 = time.time()
-        masks, bboxes_used = run_segmentation(rgb_image, vlm_bboxes, config, vlm_areas=filtered_areas)
-        t1 = time.time()
-        logger.info(f"    Generated {len(masks)} masks ({t1-t0:.1f}s)")
+    area_names = [b.get("name", f"sam3_area_{i}") for i, b in enumerate(bboxes_used)]
 
-        # For SAM3, extract area names from returned bboxes (which include 'name' key)
-        if seg_method == "sam3" and bboxes_used:
-            area_names = [b.get("name", f"sam3_area_{i}") for i, b in enumerate(bboxes_used)]
-        elif len(masks) > len(area_names):
-            # Generate area names for Grounding-DINO detections if they produced more masks
-            for i in range(len(area_names), len(masks)):
-                area_names.append(f"gdino_region_{i}")
+    result["segmentation"] = {
+        "method": "sam3",
+        "num_masks": len(masks),
+        "inference_time": round(t1 - t0, 2),
+    }
 
-        result["segmentation"] = {
-            "method": seg_method,
-            "num_masks": len(masks),
-            "num_filtered": len(areas) - len(filtered_areas),
-            "inference_time": round(t1 - t0, 2),
-        }
-        bboxes = bboxes_used
-    else:
-        masks = bbox_to_masks(vlm_bboxes, rgb_image.size)
-        bboxes = vlm_bboxes
-        result["segmentation"] = {"method": "vlm_only", "num_masks": len(masks), "skipped": True}
-
-    # ---- Stage 3.5: Depth-based flatness validation ----
+    # ── Depth-based flatness validation ───────────────────────────────────
     if masks and depth_image is not None:
         depth_array = np.array(depth_image.convert("L")).astype(np.float32)
-        validated_masks = []
-        validated_names = []
-        validated_bboxes = []
+        validated_masks, validated_names, validated_bboxes = [], [], []
         for i, (mask, name) in enumerate(zip(masks, area_names)):
-            mask_pixels = depth_array[mask > 0]
-            if len(mask_pixels) < 100:
-                logger.info(f"    Skipping '{name}' — too few pixels ({len(mask_pixels)})")
+            pixels = depth_array[mask > 0]
+            if len(pixels) < 100:
                 continue
-            # Compute depth statistics within the mask
-            depth_std = np.std(mask_pixels)
-            depth_range = np.max(mask_pixels) - np.min(mask_pixels)
-            # Flat surfaces should have low depth variance
-            # High std or range suggests stairs/inclines
-            flatness_threshold = config["pipeline"].get("depth_flatness_threshold", 80)
-            if depth_std > flatness_threshold:
-                logger.info(f"    Filtering '{name}' — depth std={depth_std:.1f} > {flatness_threshold} (likely stairs/incline)")
+            flatness_thresh = config["pipeline"].get("depth_flatness_threshold", 80)
+            if np.std(pixels) > flatness_thresh:
                 continue
-            if depth_range > flatness_threshold * 3:
-                logger.info(f"    Filtering '{name}' — depth range={depth_range:.1f} (likely stairs/incline)")
+            if np.max(pixels) - np.min(pixels) > flatness_thresh * 3:
                 continue
             validated_masks.append(mask)
             validated_names.append(name)
-            if i < len(bboxes):
-                validated_bboxes.append(bboxes[i])
+            if i < len(bboxes_used):
+                validated_bboxes.append(bboxes_used[i])
 
         if len(validated_masks) < len(masks):
-            logger.info(f"    Depth validation: kept {len(validated_masks)}/{len(masks)} masks")
+            logger.info(f"    Depth validation: kept {len(validated_masks)}/{len(masks)}")
             masks = validated_masks
             area_names = validated_names
-            bboxes = validated_bboxes
-            result["segmentation"]["depth_filtered"] = len(masks) - len(validated_masks)
+            bboxes_used = validated_bboxes
 
-    # Save segmentation masks (if any were generated)
+    # ── Save outputs ──────────────────────────────────────────────────────
     if masks and config["output"].get("save_visualizations", True):
         save_segmentation_masks(
-            masks, area_names, rgb_image, bboxes,
+            masks, area_names, rgb_image, bboxes_used,
             output_dir / folder_name, image_id,
+            depth_image=depth_image, input_mode=input_mode,
         )
 
-    # ---- Stage 4: Cost Map ----
-    scores = evaluator_output.get("traversability_score", {})
-    if config["pipeline"].get("run_cost_map", True) and masks:
-        logger.info("  Stage 4: Building cost map...")
-        t0 = time.time()
-        cost_map = build_cost_map(masks, scores, area_names, rgb_image.size, config)
-        t1 = time.time()
-        logger.info(f"    Cost map shape: {cost_map.shape} ({t1-t0:.1f}s)")
-        result["cost_map"] = {
-            "shape": list(cost_map.shape),
-            "min_cost": float(cost_map.min()),
-            "max_cost": float(cost_map.max()),
-            "mean_cost": float(cost_map.mean()),
-            "inference_time": round(t1 - t0, 2),
-        }
-
-        # Save visualizations
-        if config["output"].get("save_cost_maps", True):
-            vis_dir = output_dir / folder_name / "cost_maps"
-            vis_dir.mkdir(parents=True, exist_ok=True)
-            visualize_cost_map(cost_map, rgb_image, vis_dir / f"{image_id}_costmap.png")
-
-            # Also save raw cost map
-            np.save(vis_dir / f"{image_id}_costmap.npy", cost_map)
-
-    # Save individual result
     if config["output"].get("save_individual_json", True):
         json_dir = output_dir / folder_name
         json_dir.mkdir(parents=True, exist_ok=True)
-        json_path = json_dir / f"{image_id}_lac_analysis.json"
-        with open(json_path, "w") as f:
+        with open(json_dir / f"{image_id}_lac_analysis.json", "w") as f:
             json.dump(result, f, indent=2, default=str)
 
     return result
 
 
-def run_lac_pipeline(config: Dict):
-    """Run the full LaC-adapted free ground detection pipeline."""
-    start_time = time.time()
+# ---------------------------------------------------------------------------
+# Pipeline Runner
+# ---------------------------------------------------------------------------
 
-    # Setup output directory
-    model_name = config["model"]["reasoner"]["name"]
+def run_pipeline(config: Dict):
+    """Run the unified free ground detection pipeline."""
+    start_time = time.time()
+    strategy = config["pipeline"]["strategy"]
     input_mode = config["pipeline"].get("input_mode", "rgb_depth_separate")
-    seg_method = config["model"].get("segmentation", {}).get("method", "vlm_only")
-    lac_suffix = config["pipeline"].get("output_suffix", "")
-    lac_folder = f"{model_name}_LaC{lac_suffix}" if lac_suffix else f"{model_name}_LaC"
-    output_dir = Path(config["output"]["dir"]) / lac_folder / f"{input_mode}_{seg_method}"
+
+    # Output directory: {strategy}/{model_tag}/{input_mode}_sam3/
+    r_name = config["model"]["reasoner"]["name"]
+    e_name = config["model"].get("evaluator", {}).get("name", r_name)
+    mtag = _model_tag(strategy, r_name, e_name if strategy == "two_vlm" else None)
+    suffix = config["pipeline"].get("output_suffix", "")
+
+    output_dir = Path(config["output"]["dir"]) / strategy / mtag / f"{input_mode}_sam3"
+    if suffix:
+        output_dir = Path(config["output"]["dir"]) / f"{strategy}{suffix}" / mtag / f"{input_mode}_sam3"
+
     if config["pipeline"].get("clean_output", False) and output_dir.exists():
         logger.info(f"Cleaning output directory: {output_dir}")
         shutil.rmtree(output_dir)
@@ -1332,39 +923,56 @@ def run_lac_pipeline(config: Dict):
         logger.error("No valid folders found.")
         return
 
-    # Load VLM models
+    # ── Load models ───────────────────────────────────────────────────────
     logger.info("=" * 60)
-    logger.info("Loading VLM Models...")
+    logger.info(f"Loading models for strategy: {strategy}")
     logger.info("=" * 60)
 
-    # Stage 1 model (Reasoner)
+    # Reasoner model (always needed)
     reasoner_config = {"model": config["model"]["reasoner"]}
-    reasoner_model, reasoner_processor = load_vlm_model(reasoner_config)
+    reasoner_model, reasoner_proc = load_vlm_model(reasoner_config)
+    models = {"reasoner": (reasoner_model, reasoner_proc)}
 
-    # Stage 2 model (Evaluator) — can reuse same model
-    evaluator_config = {"model": config["model"]["evaluator"]}
-    if config["model"]["evaluator"]["hf_model_id"] == config["model"]["reasoner"]["hf_model_id"]:
-        logger.info("Reusing reasoner model for evaluator (same model)")
-        evaluator_model, evaluator_processor = reasoner_model, reasoner_processor
-    else:
-        evaluator_model, evaluator_processor = load_vlm_model(evaluator_config)
+    # Evaluator model (only for two_vlm)
+    if strategy == "two_vlm":
+        evaluator_config = {"model": config["model"]["evaluator"]}
+        if config["model"]["evaluator"]["hf_model_id"] == config["model"]["reasoner"]["hf_model_id"]:
+            logger.info("Reusing reasoner model for evaluator (same model)")
+            models["evaluator"] = (reasoner_model, reasoner_proc)
+        else:
+            logger.info(f"Loading separate evaluator model: {config['model']['evaluator']['name']}")
+            evaluator_model, evaluator_proc = load_vlm_model(evaluator_config)
+            models["evaluator"] = (evaluator_model, evaluator_proc)
 
-    # Pre-load segmentation models (SAM / SAM3 / Grounding-DINO) — done once
-    seg_method = config["model"].get("segmentation", {}).get("method", "vlm_only")
-    if seg_method == "sam3":
-        logger.info("Pre-loading SAM3 model...")
-        _load_sam3_model(config)
-    elif seg_method == "grounding_dino":
-        logger.info("Pre-loading Grounding-DINO + SAM models...")
-        _load_grounding_dino_model(config)
-        _load_sam_model(config)
-    elif seg_method == "sam":
-        logger.info("Pre-loading SAM model...")
-        _load_sam_model(config)
+    # Few-shot samples (only for few_shot)
+    few_shot_samples = None
+    few_shot_excluded = set()  # (folder, image_id) to exclude from test set
+    if strategy == "few_shot":
+        few_shot_dir = config["pipeline"].get("few_shot_dir")
+        num_examples = config["pipeline"].get("num_examples", 3)
+        if few_shot_dir:
+            few_shot_samples, few_shot_excluded = load_few_shot_samples(
+                few_shot_dir,
+                config["data"]["base_dir"],
+                config["data"]["rgb_subfolder"],
+                config["data"]["depth_subfolder"],
+                num_examples,
+            )
+            if not few_shot_samples:
+                logger.error("No few-shot samples loaded! Check --few_shot_dir path.")
+                return
+            logger.info(f"  Excluding {len(few_shot_excluded)} example images from test set")
+        else:
+            logger.error("--few_shot_dir is required for few_shot strategy")
+            return
 
+    # Pre-load SAM3
+    logger.info("Pre-loading SAM3 model...")
+    _load_sam3_model(config)
+
+    # ── Process images ────────────────────────────────────────────────────
     all_results = []
 
-    # Process each folder
     for folder in folders:
         logger.info("=" * 60)
         logger.info(f"Processing folder: {folder.name}")
@@ -1377,143 +985,53 @@ def run_lac_pipeline(config: Dict):
 
         pairs = filter_image_pairs(pairs, config, folder_name=folder.name)
 
-        for i, (rgb_path, depth_path, image_id) in enumerate(pairs):
-            # ── Resume: skip images that already have results ──
+        for rgb_path, depth_path, image_id in pairs:
+            # Skip images used as few-shot examples (prevent data leakage)
+            if (folder.name, str(image_id)) in few_shot_excluded:
+                logger.info(f"  {folder.name}/{image_id} [SKIPPED — used as few-shot example]")
+                continue
+
             existing_json = output_dir / folder.name / f"{image_id}_lac_analysis.json"
             if existing_json.exists() and not config["pipeline"].get("clean_output", False):
-                logger.info(f"Processing {folder.name}/{image_id} [SKIPPED — already processed]")
+                logger.info(f"  {folder.name}/{image_id} [SKIPPED — already processed]")
                 with open(existing_json) as f:
                     all_results.append(json.load(f))
                 continue
 
             try:
-                result = process_single_image_lac(
-                    rgb_path=rgb_path,
-                    depth_path=depth_path,
-                    image_id=image_id,
-                    folder_name=folder.name,
-                    reasoner_model=reasoner_model,
-                    reasoner_processor=reasoner_processor,
-                    evaluator_model=evaluator_model,
-                    evaluator_processor=evaluator_processor,
-                    config=config,
-                    output_dir=output_dir,
+                result = process_single_image(
+                    rgb_path, depth_path, str(image_id), folder.name,
+                    models, config, output_dir, few_shot_samples,
                 )
                 all_results.append(result)
             except Exception as e:
-                logger.error(f"Error processing {folder.name}/{image_id}: {e}")
-                all_results.append({
-                    "folder": folder.name,
-                    "image_id": image_id,
-                    "error": str(e),
-                })
+                logger.error(f"FAILED {folder.name}/{image_id}: {e}")
+                import traceback
+                traceback.print_exc()
 
-    # Save combined results
+    # Save combined CSV
     if all_results:
-        csv_path = output_dir / "lac_results_summary.json"
-        with open(csv_path, "w") as f:
-            json.dump(all_results, f, indent=2, default=str)
-        logger.info(f"Saved results to {csv_path}")
+        csv_path = output_dir / "all_results.csv"
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(
+                f, fieldnames=["folder", "image_id", "strategy", "input_mode"],
+            )
+            writer.writeheader()
+            for r in all_results:
+                writer.writerow({k: r.get(k, "") for k in ["folder", "image_id", "strategy", "input_mode"]})
 
     elapsed = time.time() - start_time
-    logger.info(f"Pipeline completed in {elapsed:.1f}s ({len(all_results)} images)")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"PIPELINE COMPLETE — {len(all_results)} images in {elapsed:.1f}s")
+    logger.info(f"{'='*60}")
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Argument Parsing
 # ---------------------------------------------------------------------------
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="LaC-adapted Free Ground Space Detection Pipeline"
-    )
-    parser.add_argument(
-        "--config", type=str, default="lac_config.yaml",
-        help="Path to YAML config file",
-    )
-    parser.add_argument(
-        "--model", type=str, default=None,
-        help=f"Override reasoner+evaluator model name. Available: {', '.join(sorted(MODEL_REGISTRY.keys()))}",
-    )
-    parser.add_argument(
-        "--hf_model_id", type=str, default=None,
-        help="Override full HuggingFace model ID for reasoner+evaluator",
-    )
-    parser.add_argument(
-        "--reasoner_model", type=str, default=None,
-        help="Override reasoner model only (name or HF ID)",
-    )
-    parser.add_argument(
-        "--evaluator_model", type=str, default=None,
-        help="Override evaluator model only (name or HF ID)",
-    )
-    parser.add_argument(
-        "--segmentation_method", type=str, default=None,
-        choices=["sam", "sam3", "grounding_dino", "vlm_only"],
-        help="Override segmentation method",
-    )
-    parser.add_argument(
-        "--grounding_dino_text_prompt", type=str, default=None,
-        help="Override Grounding-DINO text prompt (e.g. 'flat floor . floor . ground .')",
-    )
-    parser.add_argument(
-        "--grounding_dino_box_threshold", type=float, default=None,
-        help="Override Grounding-DINO box threshold (default: 0.3)",
-    )
-    parser.add_argument(
-        "--input_mode", type=str, default=None,
-        choices=["rgb_only", "rgb_depth_separate"],
-        help="Input mode for VLM: rgb_only (single RGB), "
-             "rgb_depth_separate (RGB + depth as two separate images)",
-    )
-    parser.add_argument(
-        "--specific_images", nargs="+", default=None,
-        help="Specific image IDs to process (e.g., image28 image86)",
-    )
-    parser.add_argument(
-        "--gt_dir", type=str, default=None,
-        help="Path to annotated ground truth directory. Reads exact folder→image "
-             "mapping so only annotated images are processed in their specific folders.",
-    )
-    parser.add_argument(
-        "--folders", nargs="+", default=None,
-        help="Specific folder names to process",
-    )
-    parser.add_argument(
-        "--quick_test", action="store_true",
-        help="Quick test: 3 images per folder",
-    )
-    parser.add_argument(
-        "--stages", type=str, default=None,
-        help="Comma-separated stages to run: reasoner,evaluator,segmentation,costmap",
-    )
-    parser.add_argument(
-        "--prompt_dir", type=str, default=None,
-        help="Path to custom prompt directory (default: lac_free_ground/prompts/). "
-             "Use 'prompts_navigable' for the navigable-area variant.",
-    )
-    parser.add_argument(
-        "--output_suffix", type=str, default=None,
-        help="Suffix appended to output folder name (e.g., 'navigable' → {model}_LaC_navigable/...). "
-             "Prevents overwriting previous results.",
-    )
-    parser.add_argument(
-        "--clean", action="store_true",
-        help="Remove output directory before running (avoids stale files)",
-    )
-    parser.add_argument(
-        "--verbose", action="store_true",
-        help="Enable DEBUG logging",
-    )
-    return parser.parse_args()
-
 
 def _resolve_model_id(name_or_id: str) -> Tuple[str, str]:
-    """Resolve a model name or HF ID to (name, hf_model_id).
-
-    Checks MODEL_REGISTRY first, then treats as a full HF ID if it
-    contains '/', otherwise uses as-is for both name and ID.
-    """
+    """Resolve a model name or HF ID to (name, hf_model_id)."""
     if name_or_id in MODEL_REGISTRY:
         return name_or_id, MODEL_REGISTRY[name_or_id]
     if "/" in name_or_id:
@@ -1521,52 +1039,112 @@ def _resolve_model_id(name_or_id: str) -> Tuple[str, str]:
     return name_or_id, name_or_id
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Unified Free Ground Space Detection Pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Zero-shot
+  python lac_pipeline.py --strategy zero_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_only
+
+  # Few-shot
+  python lac_pipeline.py --strategy few_shot --model Qwen2.5-VL-7B-Instruct \\
+      --input_mode rgb_depth_separate --few_shot_dir /path/to/samples
+
+  # Two-VLM (same model)
+  python lac_pipeline.py --strategy two_vlm --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate
+
+  # Two-VLM (different models)
+  python lac_pipeline.py --strategy two_vlm \\
+      --reasoner_model Qwen2.5-VL-7B-Instruct --evaluator_model gemma-4-E4B-it \\
+      --input_mode rgb_depth_separate
+        """,
+    )
+    # Strategy
+    parser.add_argument("--strategy", type=str, default="two_vlm",
+                        choices=STRATEGIES,
+                        help="Pipeline strategy (default: two_vlm)")
+    parser.add_argument("--config", type=str, default="lac_config.yaml",
+                        help="Path to YAML config file")
+
+    # Model selection
+    parser.add_argument("--model", type=str, default=None,
+                        help="Model for all VLM stages (name or HF ID)")
+    parser.add_argument("--reasoner_model", type=str, default=None,
+                        help="Reasoner model (overrides --model for reasoner)")
+    parser.add_argument("--evaluator_model", type=str, default=None,
+                        help="Evaluator model (overrides --model for evaluator, two_vlm only)")
+    parser.add_argument("--hf_model_id", type=str, default=None,
+                        help="Override full HuggingFace model ID")
+
+    # Input mode
+    parser.add_argument("--input_mode", type=str, default=None,
+                        choices=INPUT_MODES,
+                        help="Input mode: rgb_only or rgb_depth_separate")
+
+    # Few-shot
+    parser.add_argument("--few_shot_dir", type=str, default=None,
+                        help="Directory with few-shot sample images (required for few_shot strategy)")
+    parser.add_argument("--num_examples", type=int, default=3,
+                        help="Number of few-shot examples to use (default: 3)")
+
+    # Data filtering
+    parser.add_argument("--specific_images", nargs="+", default=None,
+                        help="Specific image IDs to process")
+    parser.add_argument("--gt_dir", type=str, default=None,
+                        help="Path to annotated ground truth directory")
+    parser.add_argument("--folders", nargs="+", default=None,
+                        help="Specific folder names to process")
+    parser.add_argument("--quick_test", action="store_true",
+                        help="Quick test: 3 images per folder")
+
+    # Output
+    parser.add_argument("--prompt_dir", type=str, default=None,
+                        help="Path to custom prompt directory")
+    parser.add_argument("--output_suffix", type=str, default=None,
+                        help="Suffix appended to output folder name")
+    parser.add_argument("--clean", action="store_true",
+                        help="Remove output directory before running")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Enable DEBUG logging")
+    return parser.parse_args()
+
+
 def merge_args(config: Dict, args: argparse.Namespace) -> Dict:
     """Merge CLI arguments into config. CLI takes precedence."""
-    # --model overrides both reasoner and evaluator
+    strategy = getattr(args, "strategy", None) or config["pipeline"].get("strategy", "two_vlm")
+    config["pipeline"]["strategy"] = strategy
+
+    # Model: --model sets both reasoner and evaluator
     if getattr(args, "model", None):
-        model_name, hf_id = _resolve_model_id(args.model)
+        name, hf_id = _resolve_model_id(args.model)
         for stage in ["reasoner", "evaluator"]:
-            config["model"][stage]["name"] = model_name
+            config["model"][stage]["name"] = name
             config["model"][stage]["hf_model_id"] = hf_id
 
     if getattr(args, "hf_model_id", None):
-        model_name = args.hf_model_id.split("/")[-1]
+        name = args.hf_model_id.split("/")[-1]
         for stage in ["reasoner", "evaluator"]:
-            config["model"][stage]["name"] = model_name
+            config["model"][stage]["name"] = name
             config["model"][stage]["hf_model_id"] = args.hf_model_id
 
-    # --reasoner_model / --evaluator_model override individual stages
-    # When --reasoner_model is set without --evaluator_model, reuse same model for both
+    # Reasoner model override
     if getattr(args, "reasoner_model", None):
         name, hf_id = _resolve_model_id(args.reasoner_model)
         config["model"]["reasoner"]["name"] = name
         config["model"]["reasoner"]["hf_model_id"] = hf_id
-        # Also set evaluator to same model unless explicitly overridden
-        if not getattr(args, "evaluator_model", None):
+        # If no evaluator specified, use same as reasoner
+        if not getattr(args, "evaluator_model", None) and not getattr(args, "model", None):
             config["model"]["evaluator"]["name"] = name
             config["model"]["evaluator"]["hf_model_id"] = hf_id
 
+    # Evaluator model override
     if getattr(args, "evaluator_model", None):
         name, hf_id = _resolve_model_id(args.evaluator_model)
         config["model"]["evaluator"]["name"] = name
         config["model"]["evaluator"]["hf_model_id"] = hf_id
 
-    # Segmentation overrides
-    if getattr(args, "segmentation_method", None):
-        config["model"]["segmentation"]["method"] = args.segmentation_method
-
-    if getattr(args, "grounding_dino_text_prompt", None):
-        config["model"]["segmentation"]["grounding_dino_text_prompt"] = (
-            args.grounding_dino_text_prompt
-        )
-
-    if getattr(args, "grounding_dino_box_threshold", None) is not None:
-        config["model"]["segmentation"]["grounding_dino_box_threshold"] = (
-            args.grounding_dino_box_threshold
-        )
-
-    # Pipeline overrides
     if getattr(args, "input_mode", None):
         config["pipeline"]["input_mode"] = args.input_mode
 
@@ -1592,12 +1170,11 @@ def merge_args(config: Dict, args: argparse.Namespace) -> Dict:
     if getattr(args, "quick_test", False):
         config["pipeline"]["num_images_per_folder"] = 3
 
-    if getattr(args, "stages", None):
-        stages = [s.strip() for s in args.stages.split(",")]
-        config["pipeline"]["run_reasoner"] = "reasoner" in stages
-        config["pipeline"]["run_evaluator"] = "evaluator" in stages
-        config["pipeline"]["run_segmentation"] = "segmentation" in stages
-        config["pipeline"]["run_cost_map"] = "costmap" in stages
+    if getattr(args, "few_shot_dir", None):
+        config["pipeline"]["few_shot_dir"] = args.few_shot_dir
+
+    if getattr(args, "num_examples", None):
+        config["pipeline"]["num_examples"] = args.num_examples
 
     if getattr(args, "clean", False):
         config["pipeline"]["clean_output"] = True
@@ -1608,82 +1185,68 @@ def merge_args(config: Dict, args: argparse.Namespace) -> Dict:
     return config
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
-    # ── Ensure all HuggingFace downloads/cache use $WORK ──────────────
     _work_dir = os.environ.get("WORK", str(Path(__file__).parent.parent))
     os.environ.setdefault("HF_HOME", os.path.join(_work_dir, ".cache", "huggingface"))
-    os.environ["HF_HUB_OFFLINE"] = "1"
-    logger.info(f"HuggingFace cache (HF_HOME): {os.environ['HF_HOME']}")
 
     args = parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # Set custom prompt directory if provided
-    if getattr(args, "prompt_dir", None):
-        prompt_path = Path(args.prompt_dir)
-        if not prompt_path.is_absolute():
-            prompt_path = Path(__file__).parent / prompt_path
-        set_prompt_dir(prompt_path)
-        logger.info(f"Using custom prompt directory: {prompt_path}")
-
     # Load config
-    config_path = args.config
-    if not Path(config_path).exists():
-        # Try relative to script directory
-        config_path = Path(__file__).parent / config_path
-    config = yaml.safe_load(open(config_path))
+    config_path = Path(args.config)
+    if not config_path.exists():
+        config_path = Path(__file__).parent / args.config
+    if not config_path.exists():
+        logger.error(f"Config file not found: {args.config}")
+        sys.exit(1)
+
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+
     config = merge_args(config, args)
 
-    # Reconfigure logging with model-specific directory
-    model_name = config["model"]["reasoner"]["name"]
-    output_suffix = config["pipeline"].get("output_suffix", "")
-    log_dir = _make_log_dir(model_name, suffix=output_suffix)
-    log_file = log_dir / f"lac_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    root_logger = logging.getLogger()
-    # Remove existing handlers and add new ones with model-specific path
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-    root_logger.addHandler(logging.StreamHandler())
-    root_logger.addHandler(logging.FileHandler(log_file))
+    # Set prompt directory
+    if args.prompt_dir:
+        set_prompt_dir(Path(args.prompt_dir))
 
-    seg_method = config["model"].get("segmentation", {}).get("method", "vlm_only")
+    # Setup logging to file
+    strategy = config["pipeline"]["strategy"]
+    r_name = config["model"]["reasoner"]["name"]
+    e_name = config["model"].get("evaluator", {}).get("name", r_name)
+    mtag = _model_tag(strategy, r_name, e_name if strategy == "two_vlm" else None)
+    global _LOG_MODEL_NAME
+    _LOG_MODEL_NAME = mtag
 
-    # Print summary
-    logger.info("=" * 60)
-    logger.info("LaC FREE GROUND DETECTION PIPELINE")
-    logger.info(f"Log file: {log_file}")
-    logger.info("=" * 60)
-    logger.info(f"Reasoner model: {config['model']['reasoner']['name']} "
-                f"({config['model']['reasoner']['hf_model_id']})")
-    logger.info(f"Evaluator model: {config['model']['evaluator']['name']} "
-                f"({config['model']['evaluator']['hf_model_id']})")
-    logger.info(f"Segmentation method: {seg_method}")
-    if seg_method == "sam3":
-        sam3_id = config["model"]["segmentation"].get("sam3_model_id", "facebook/sam3")
-        sam3_thresh = config["model"]["segmentation"].get("sam3_mask_threshold", 0.5)
-        logger.info(f"  SAM3 model: {sam3_id}")
-        logger.info(f"  Mask threshold: {sam3_thresh}")
-    elif seg_method == "grounding_dino":
-        gdino_id = config["model"]["segmentation"].get("grounding_dino_model_id", "N/A")
-        gdino_prompt = config["model"]["segmentation"].get("grounding_dino_text_prompt", "N/A")
-        gdino_box_th = config["model"]["segmentation"].get("grounding_dino_box_threshold", 0.3)
-        logger.info(f"  Grounding-DINO model: {gdino_id}")
-        logger.info(f"  Text prompt: '{gdino_prompt}'")
-        logger.info(f"  Box threshold: {gdino_box_th}")
-    elif seg_method == "sam":
-        sam_id = config["model"]["segmentation"].get("sam_model_id", "N/A")
-        logger.info(f"  SAM model: {sam_id}")
-    logger.info(f"Input mode: {config['pipeline'].get('input_mode', 'rgb_depth_separate')}")
-    logger.info(f"Stages: reasoner={config['pipeline'].get('run_reasoner', True)}, "
-                f"evaluator={config['pipeline'].get('run_evaluator', True)}, "
-                f"segmentation={config['pipeline'].get('run_segmentation', True)}, "
-                f"costmap={config['pipeline'].get('run_cost_map', True)}")
-    logger.info(f"Output: {config['output']['dir']}")
-    logger.info("=" * 60)
+    log_dir = Path(_WORK_DIR) / "free_ground_results" / f"{strategy}_{mtag}" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    fh = logging.FileHandler(log_dir / f"pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logging.getLogger().addHandler(fh)
 
-    run_lac_pipeline(config)
+    # Print config summary
+    input_mode = config["pipeline"].get("input_mode", "rgb_depth_separate")
+    logger.info("=" * 60)
+    logger.info("Unified Free Ground Space Detection Pipeline")
+    logger.info("=" * 60)
+    logger.info(f"Strategy:     {strategy}")
+    logger.info(f"Input mode:   {input_mode}")
+    logger.info(f"Reasoner:     {config['model']['reasoner']['name']}")
+    if strategy == "two_vlm":
+        logger.info(f"Evaluator:    {config['model']['evaluator']['name']}")
+        same = config["model"]["evaluator"]["hf_model_id"] == config["model"]["reasoner"]["hf_model_id"]
+        logger.info(f"Same model:   {same}")
+    if strategy == "few_shot":
+        logger.info(f"Few-shot dir: {config['pipeline'].get('few_shot_dir', 'NOT SET')}")
+        logger.info(f"Num examples: {config['pipeline'].get('num_examples', 3)}")
+    logger.info(f"Segmentation: SAM3 ({config['model']['segmentation'].get('sam3_model_id', 'facebook/sam3')})")
+
+    run_pipeline(config)
 
 
 if __name__ == "__main__":

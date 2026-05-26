@@ -16,7 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_DIR="${WORK:-/home/woody/iwnt/iwnt164h}"
 PY="$WORK_DIR/venvs/marigold/bin/python3"
 RESULTS_DIR="$WORK_DIR/free_ground_results"
-GT_DIR="$RESULTS_DIR/Annotated_Ground_Truth"
+GT_DIR="$WORK_DIR/mlp_ground_truth/proper_annotations"
 
 DRY_RUN=false
 

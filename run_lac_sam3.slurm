@@ -24,7 +24,7 @@ RESULTS_DIR="$WORK_DIR/free_ground_results"
 GT_DIR="$RESULTS_DIR/Annotated_Ground_Truth"
 
 MODELS=("Qwen2.5-VL-7B-Instruct" "gemma-4-E4B-it")
-MODES=("rgb_only" "rgb_depth_overlay")
+MODES=("rgb_only" "rgb_depth_separate")
 
 CLEAN_FLAG=""
 DRY_RUN=false
@@ -65,7 +65,7 @@ for MODEL in "${MODELS[@]}"; do
         LOG_OUT="$RESULTS_DIR/slurm_logs/${JOB_NAME}_%j.out"
 
         # SAM3 uses VLM text output directly — no Grounding-DINO prompt needed
-        WRAP_CMD="export HF_HOME=$WORK_DIR/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $LAC_DIR && $PY lac_pipeline.py --model $MODEL --input_mode $MODE --segmentation_method sam3 --prompt_dir prompts_navigable --output_suffix _navigable --gt_dir $GT_DIR $CLEAN_FLAG"
+        WRAP_CMD="export HF_HOME=$WORK_DIR/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $LAC_DIR && $PY lac_pipeline.py --model $MODEL --input_mode $MODE --prompt_dir prompts_navigable --output_suffix _navigable --gt_dir $GT_DIR $CLEAN_FLAG"
 
         if $DRY_RUN; then
             echo "DRY-RUN:"
