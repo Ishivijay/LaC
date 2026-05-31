@@ -128,9 +128,8 @@ def extract_floor_masks(
         logger.info(f"Images shape: {images.shape}")
         
         for new_idx, old_idx in enumerate(test_indices):
-            # Extract label map
-            label_map = labels[old_idx]  # (640, 480) uint16
-            label_map = np.array(label_map).T  # Transpose to (480, 640)
+            # Extract label map — same (640, 480) layout as images, no transpose needed
+            label_map = np.array(labels[old_idx])  # (640, 480) uint16
             
             # Create binary floor mask
             floor_mask = (label_map == FLOOR_CLASS_ID).astype(np.uint8) * 255

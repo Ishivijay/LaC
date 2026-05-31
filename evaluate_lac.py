@@ -36,7 +36,7 @@ DEFAULT_GT_MASK_DIR = WORK_DIR / "mlp_ground_truth" / "proper_annotations"
 DEFAULT_DATA_DIR = (
     WORK_DIR / "mlp_dataset" / "prospthesisproject-Data" / "Code" / "Data"
 )
-DEFAULT_OUTPUT_DIR = WORK_DIR / "free_ground_results" / "evaluation"
+DEFAULT_OUTPUT_DIR = WORK_DIR / "free_ground_results" / "evaluation_v2"
 
 STRATEGIES = ["zero_shot", "few_shot", "two_vlm"]
 MODELS = ["Qwen", "Gemma"]
@@ -65,19 +65,22 @@ def discover_gt_annotations(gt_mask_dir: Path) -> Dict[str, tuple]:
 def discover_runs(results_dir: Path) -> List[Dict]:
     """Discover all pipeline runs from the results directory.
 
-    Scans: {results_dir}/{strategy}/{model_tag}/{input_mode}_sam3/
+    Scans: {results_dir}/{strategy}/{model_tag}/{input_mode}/
     """
     runs = []
     if not results_dir.exists():
         return runs
 
+    VALID_MODES = {"rgb_only", "rgb_depth_separate"}
+    skip_dirs = {"slurm_logs", "logs", "evaluation", "comparison", "evaluation_v2",
+                 "comparison_v2", "Annotated_Ground_Truth",
+                 "lac_navigable_evaluation", "lac_navigable_comparison",
+                 "lac_navigable_evaluation_v2", "lac_navigable_comparison_v2"}
+
     for strategy_dir in sorted(results_dir.iterdir()):
-        if not strategy_dir.is_dir():
+        if not strategy_dir.is_dir() or strategy_dir.name in skip_dirs:
             continue
         strategy = strategy_dir.name
-        if strategy in ("slurm_logs", "logs", "evaluation", "comparison",
-                        "lac_navigable_evaluation", "lac_navigable_comparison"):
-            continue
 
         for model_dir in sorted(strategy_dir.iterdir()):
             if not model_dir.is_dir():
@@ -85,11 +88,9 @@ def discover_runs(results_dir: Path) -> List[Dict]:
             model_tag = model_dir.name
 
             for mode_dir in sorted(model_dir.iterdir()):
-                if not mode_dir.is_dir():
+                if not mode_dir.is_dir() or mode_dir.name not in VALID_MODES:
                     continue
-                if not mode_dir.name.endswith("_sam3"):
-                    continue
-                input_mode = mode_dir.name.replace("_sam3", "")
+                input_mode = mode_dir.name
 
                 # Determine model names from tag
                 parts = model_tag.split("_")
@@ -194,6 +195,8 @@ def evaluate_single_image(
     metadata = {}
     prediction_found = False
     num_vlm_areas = 0
+    vlm_areas = []
+    evaluator_areas = []
 
     # Load analysis JSON
     json_path = run_dir / folder / f"{image_id}_lac_analysis.json"
@@ -209,6 +212,14 @@ def evaluate_single_image(
             total_time = r_time
             if s_time is not None:
                 total_time += s_time
+
+        # Extract VLM areas with bboxes
+        vlm_areas = analysis.get("vlm_areas", [])
+
+        # Extract evaluator areas with scores (two_vlm strategy)
+        evaluator_data = analysis.get("evaluator", {})
+        evaluator_areas = evaluator_data.get("areas_with_scores", [])
+
         metadata = {
             "num_vlm_areas": num_vlm_areas,
             "reasoner_time": r_time,
@@ -218,6 +229,7 @@ def evaluate_single_image(
 
     # Load masks
     mask_dir = run_dir / folder / "masks"
+    mask_pngs = []
     if mask_dir.exists():
         mask_pngs = sorted([f for f in mask_dir.glob(f"{image_id}_mask_*.png")
                            if "overlay" not in f.name])
@@ -238,6 +250,8 @@ def evaluate_single_image(
         "prediction_found": prediction_found,
         "num_masks": len(mask_pngs) if prediction_found else 0,
         "num_vlm_areas": num_vlm_areas,
+        "vlm_areas": vlm_areas,
+        "evaluator_areas": evaluator_areas,
         **metrics, **metadata,
     }
 

@@ -34,6 +34,7 @@ model:
     method: "sam3"
     sam3_model_id: "facebook/sam3"
     sam3_mask_threshold: 0.5
+    sam3_input_mode: "text_only"   # text_only | bbox_only | text_and_bbox
     device: "cuda"
 
 # Pipeline settings

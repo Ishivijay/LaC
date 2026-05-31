@@ -64,7 +64,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Import shared utilities from free_ground_pipeline
-sys.path.insert(0, str(Path(__file__).parent.parent / "free_ground_pipeline"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "free_ground_pipeline"))
 from pipeline import (
     MODEL_REGISTRY,
     discover_folders,
@@ -501,31 +501,42 @@ def _load_sam3_model(config: Dict):
         _sam3_cache["loaded"] = True
         logger.info("SAM3 model loaded successfully")
     except Exception as e:
-        logger.warning(f"SAM3 model load failed ({e}), will use bbox masks as fallback")
+        logger.error(f"SAM3 model load failed ({e}) — segmentation will be skipped")
         _sam3_cache["failed"] = True
 
 
 def _segment_with_sam3(
     rgb_image: Image.Image, vlm_areas: List[Dict], config: Dict,
 ) -> Tuple[List[np.ndarray], List[Dict]]:
-    """SAM3 text-prompted segmentation from VLM area descriptions."""
+    """SAM3 segmentation with configurable input mode.
+
+    sam3_input_mode controls what VLM output is fed to SAM3:
+      - "text_only":     VLM text prompt only (default)
+      - "bbox_only":     VLM bounding box only (no text)
+      - "text_and_bbox": Both text prompt and bounding box
+
+    If SAM3 produces no valid masks, falls back to VLM bbox → binary mask.
+    """
     import torch
     import torch.nn.functional as F
 
     w, h = rgb_image.size
+    seg_config = config["model"].get("segmentation", {})
+    sam3_mode = seg_config.get("sam3_input_mode", "text_only")
 
     if not _sam3_cache["loaded"] and not _sam3_cache["failed"]:
         _load_sam3_model(config)
 
     if _sam3_cache["failed"] or not _sam3_cache["loaded"]:
-        logger.warning("    SAM3 unavailable, falling back to bbox masks")
-        vlm_bboxes = [a.get("bbox", {}) for a in vlm_areas if a.get("bbox")]
-        return _bbox_to_masks(vlm_bboxes, rgb_image.size), vlm_bboxes
+        logger.warning("    SAM3 model unavailable — no segmentation possible")
+        return [], []
 
     sam3_model = _sam3_cache["model"]
     sam3_processor = _sam3_cache["processor"]
     device = next(sam3_model.parameters()).device
-    mask_threshold = config["model"].get("segmentation", {}).get("sam3_mask_threshold", 0.5)
+    mask_threshold = seg_config.get("sam3_mask_threshold", 0.5)
+
+    logger.info(f"    SAM3 input mode: {sam3_mode}")
 
     masks = []
     bboxes = []
@@ -533,34 +544,114 @@ def _segment_with_sam3(
     for area in vlm_areas:
         name = area.get("name", "")
         area_type = area.get("type", "")
-        text_prompt = name or area_type.replace("_", " ") or "floor"
+        text_prompt = name or area_type.replace("_", " ")
 
-        logger.info(f"      SAM3 prompt: '{text_prompt}'")
+        vlm_bbox = area.get("bbox", {})
+        has_vlm_bbox = vlm_bbox and all(k in vlm_bbox for k in ["x1", "y1", "x2", "y2"])
+
+        # Determine what inputs to use based on mode
+        use_text = sam3_mode in ("text_only", "text_and_bbox")
+        use_bbox = sam3_mode in ("bbox_only", "text_and_bbox")
+
+        # Skip if required input is missing
+        if use_text and not text_prompt:
+            if use_bbox and has_vlm_bbox:
+                use_text = False  # Fall back to bbox-only for this area
+            else:
+                logger.warning("      Skipping area with no name/type from VLM")
+                continue
+
+        if use_bbox and not has_vlm_bbox:
+            if use_text and text_prompt:
+                use_bbox = False  # Fall back to text-only for this area
+            else:
+                logger.warning(f"      Skipping '{name}': no bbox from VLM")
+                continue
+
+        # Build log label
+        parts = []
+        if use_text:
+            parts.append(f"text='{text_prompt}'")
+        if use_bbox:
+            parts.append(f"bbox({vlm_bbox['x1']},{vlm_bbox['y1']},{vlm_bbox['x2']},{vlm_bbox['y2']})")
+        logger.info(f"      SAM3 input: {' + '.join(parts)}")
 
         try:
-            inputs = sam3_processor(
-                images=rgb_image, text=text_prompt, return_tensors="pt",
-            ).to(device)
+            # ── Build processor inputs based on mode ──────────────────────
+            processor_kwargs = {
+                "images": rgb_image,
+                "return_tensors": "pt",
+            }
+
+            if use_text:
+                processor_kwargs["text"] = text_prompt
+
+            if use_bbox:
+                # Convert percentage bbox to pixel coordinates
+                box_xyxy = [
+                    vlm_bbox["x1"] / 100 * w,
+                    vlm_bbox["y1"] / 100 * h,
+                    vlm_bbox["x2"] / 100 * w,
+                    vlm_bbox["y2"] / 100 * h,
+                ]
+                processor_kwargs["input_boxes"] = [[box_xyxy]]
+                processor_kwargs["input_boxes_labels"] = [[1]]
+
+            inputs = sam3_processor(**processor_kwargs).to(device, dtype=torch.float16)
 
             with torch.no_grad():
                 outputs = sam3_model(**inputs)
 
-            scores = (
-                outputs.pred_logits.sigmoid().squeeze(0)
-                * outputs.presence_logits.sigmoid().squeeze(0)
-            )
-            best_idx = scores.argmax().item()
-            best_score = scores[best_idx].item()
+            # ── Post-process: use official API for bbox-only, manual for text ─
+            if use_bbox and not use_text:
+                # bbox-only: use post_process_instance_segmentation
+                # (matches test_sam3_bbox.py working implementation)
+                results = sam3_processor.post_process_instance_segmentation(
+                    outputs,
+                    threshold=0.5,
+                    mask_threshold=mask_threshold,
+                    target_sizes=inputs.get("original_sizes").tolist(),
+                )[0]
 
-            best_mask_logits = outputs.pred_masks[0, best_idx].unsqueeze(0).unsqueeze(0).float()
-            best_mask_probs = torch.sigmoid(best_mask_logits)
-            best_mask_resized = F.interpolate(
-                best_mask_probs, size=(h, w), mode="bilinear", align_corners=False,
-            )
-            best_mask = best_mask_resized.squeeze().cpu().numpy() > mask_threshold
+                sam3_masks = results.get("masks", [])
+                sam3_scores = results.get("scores", [])
+
+                # Use len() only — `not tensor` raises
+                # "Boolean value of Tensor with more than one value is ambiguous"
+                if len(sam3_masks) == 0:
+                    logger.info(f"      SAM3 bbox-only: no masks for '{name}'")
+                    continue
+
+                # Take best mask by score
+                best_idx = 0
+                if len(sam3_scores) > 0:
+                    scores_t = sam3_scores if torch.is_tensor(sam3_scores) else torch.tensor(sam3_scores)
+                    best_idx = int(scores_t.argmax().item())
+
+                best_mask = sam3_masks[best_idx]
+                if hasattr(best_mask, "cpu"):
+                    best_mask = best_mask.cpu().numpy()
+                best_mask = best_mask.astype(bool)
+                best_score = float(sam3_scores[best_idx]) if best_idx < len(sam3_scores) else 0.0
+
+            else:
+                # text-only or text+bbox: use manual post-processing
+                scores = (
+                    outputs.pred_logits.sigmoid().squeeze(0)
+                    * outputs.presence_logits.sigmoid().squeeze(0)
+                )
+                best_idx = scores.argmax().item()
+                best_score = scores[best_idx].item()
+
+                best_mask_logits = outputs.pred_masks[0, best_idx].unsqueeze(0).unsqueeze(0).float()
+                best_mask_probs = torch.sigmoid(best_mask_logits)
+                best_mask_resized = F.interpolate(
+                    best_mask_probs, size=(h, w), mode="bilinear", align_corners=False,
+                )
+                best_mask = best_mask_resized.squeeze().cpu().numpy() > mask_threshold
 
             if best_mask.sum() < 100:
-                logger.info(f"      SAM3 mask for '{text_prompt}' too small, skipping")
+                logger.info(f"      SAM3 mask for '{name}' too small, skipping")
                 continue
 
             masks.append(best_mask)
@@ -572,29 +663,68 @@ def _segment_with_sam3(
                 "y2": round(int(ys.max()) / h * 100, 2),
                 "score": round(best_score, 4),
                 "source": "sam3",
-                "name": text_prompt,
+                "name": name or text_prompt,
+                "sam3_mode": sam3_mode,
             })
 
             coverage = best_mask.sum() / (h * w) * 100
-            logger.info(f"      SAM3: '{text_prompt}' score={best_score:.3f} coverage={coverage:.1f}%")
+            logger.info(f"      SAM3: '{name}' score={best_score:.3f} coverage={coverage:.1f}%")
 
         except Exception as e:
-            logger.warning(f"      SAM3 failed for '{text_prompt}': {e}")
-            bbox = area.get("bbox", {})
-            if bbox and all(k in bbox for k in ["x1", "y1", "x2", "y2"]):
-                mask = np.zeros((h, w), dtype=bool)
-                x1 = int(bbox["x1"] / 100 * w)
-                y1 = int(bbox["y1"] / 100 * h)
-                x2 = int(bbox["x2"] / 100 * w)
-                y2 = int(bbox["y2"] / 100 * h)
-                mask[y1:y2, x1:x2] = True
-                masks.append(mask)
-                bboxes.append({**bbox, "source": "sam3_fallback", "name": text_prompt})
+            logger.warning(f"      SAM3 failed for '{name}': {e}")
+            continue
 
     if not masks:
-        logger.warning("    SAM3 produced no valid masks, falling back to bbox masks")
-        vlm_bboxes = [a.get("bbox", {}) for a in vlm_areas if a.get("bbox")]
-        return _bbox_to_masks(vlm_bboxes, rgb_image.size), vlm_bboxes
+        logger.warning("    SAM3 produced no valid masks — no segmentation for this image")
+        return [], []
+
+    return masks, bboxes
+
+
+def _fallback_bbox_masks(
+    vlm_areas: List[Dict], image_size: Tuple[int, int],
+) -> Tuple[List[np.ndarray], List[Dict]]:
+    """Convert VLM bounding boxes directly to binary masks (fallback).
+
+    Used when SAM3 produces no valid masks or is unavailable.
+    """
+    w, h = image_size
+    masks = []
+    bboxes = []
+
+    for area in vlm_areas:
+        vlm_bbox = area.get("bbox", {})
+        if not vlm_bbox or not all(k in vlm_bbox for k in ["x1", "y1", "x2", "y2"]):
+            continue
+
+        name = area.get("name", "")
+        x1 = int(vlm_bbox["x1"] / 100 * w)
+        y1 = int(vlm_bbox["y1"] / 100 * h)
+        x2 = int(vlm_bbox["x2"] / 100 * w)
+        y2 = int(vlm_bbox["y2"] / 100 * h)
+
+        mask = np.zeros((h, w), dtype=bool)
+        mask[y1:y2, x1:x2] = True
+
+        if mask.sum() < 100:
+            continue
+
+        masks.append(mask)
+        bboxes.append({
+            "x1": vlm_bbox["x1"],
+            "y1": vlm_bbox["y1"],
+            "x2": vlm_bbox["x2"],
+            "y2": vlm_bbox["y2"],
+            "score": None,
+            "source": "vlm_bbox",
+            "name": name,
+        })
+        coverage = mask.sum() / (h * w) * 100
+        logger.info(f"      VLM bbox fallback: '{name}' bbox=({vlm_bbox['x1']},{vlm_bbox['y1']},"
+                     f"{vlm_bbox['x2']},{vlm_bbox['y2']}) coverage={coverage:.1f}%")
+
+    if not masks:
+        logger.warning("    No valid VLM bboxes for fallback either")
 
     return masks, bboxes
 
@@ -618,18 +748,46 @@ def _bbox_to_masks(bboxes: List[Dict], image_size: Tuple[int, int]) -> List[np.n
 # Mask Saving
 # ---------------------------------------------------------------------------
 
+def _draw_vlm_bboxes(rgb_array: np.ndarray, vlm_areas: List[Dict]) -> np.ndarray:
+    """Draw VLM bounding boxes on RGB image (percentage-based coords)."""
+    import cv2
+    img = rgb_array.copy()
+    h, w = img.shape[:2]
+    bbox_colors = [
+        (0, 255, 0), (0, 128, 255), (255, 0, 255),
+        (255, 255, 0), (0, 255, 255), (255, 128, 0),
+    ]
+    for i, area in enumerate(vlm_areas):
+        bbox = area.get("bbox", {})
+        if not bbox or not all(k in bbox for k in ("x1", "y1", "x2", "y2")):
+            continue
+        x1 = int(bbox["x1"] / 100 * w)
+        y1 = int(bbox["y1"] / 100 * h)
+        x2 = int(bbox["x2"] / 100 * w)
+        y2 = int(bbox["y2"] / 100 * h)
+        color = bbox_colors[i % len(bbox_colors)]
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+        label = area.get("name", f"area_{i}")
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        (tw, th), _ = cv2.getTextSize(label, font, 0.5, 1)
+        cv2.rectangle(img, (x1, y1 - th - 8), (x1 + tw + 4, y1), color, -1)
+        cv2.putText(img, label, (x1 + 2, y1 - 4), font, 0.5, (255, 255, 255), 1)
+    return img
+
+
 def save_segmentation_masks(
     masks: List[np.ndarray], area_names: List[str],
     rgb_image: Image.Image, bboxes: List[Dict],
     output_dir: Path, image_id: str,
     depth_image: Image.Image = None,
     input_mode: str = "rgb_only",
+    vlm_areas: List[Dict] = None,
 ):
     """Save segmentation masks as PNGs + overlay + consolidated visualization.
 
     Consolidated image layout:
-      rgb_only:         [Original RGB] | [Segmentation Overlay]
-      rgb_depth_separate: [Original RGB] | [Depth Map] | [Segmentation Overlay]
+      rgb_only:         [Original RGB] | [VLM BBox] | [Segmentation Overlay]
+      rgb_depth_separate: [Original RGB] | [Depth Map] | [VLM BBox] | [Segmentation Overlay]
     """
     mask_dir = output_dir / "masks"
     mask_dir.mkdir(parents=True, exist_ok=True)
@@ -675,11 +833,16 @@ def save_segmentation_masks(
             depth_rgb = np.array(depth_image.convert("RGB").resize((w, h), Image.NEAREST))
         panels.append(("Depth Map", depth_rgb))
 
-    # Panel 3: Segmentation overlay
+    # Panel: VLM BBox visualization
+    if vlm_areas:
+        vlm_bbox_img = _draw_vlm_bboxes(rgb_array, vlm_areas)
+        panels.append(("VLM BBox", vlm_bbox_img))
+
+    # Panel: Segmentation overlay
     panels.append(("Segmentation", overlay))
 
     # Build consolidated image with labels
-    total_w = sum(p.shape[1] for p in panels) + gap * (len(panels) - 1)
+    total_w = sum(panel.shape[1] for _, panel in panels) + gap * (len(panels) - 1)
     total_h = h + label_h
     consolidated = np.full((total_h, total_w, 3), 255, dtype=np.uint8)
 
@@ -814,6 +977,15 @@ def process_single_image(
             result["evaluator"] = {
                 "output": evaluator_output,
                 "inference_time": round(t1 - t0, 2),
+                "areas_with_scores": [
+                    {
+                        "name": a.get("name", ""),
+                        "type": a.get("type", ""),
+                        "bbox": a.get("bbox", {}),
+                        "traversability_score": scores.get(a.get("name", ""), None),
+                    }
+                    for a in areas
+                ],
             }
 
             # Filter score=0 areas
@@ -830,6 +1002,16 @@ def process_single_image(
             areas = filtered
         else:
             result["evaluator"] = {"output": {}, "skipped": True}
+
+    # Store VLM areas with bboxes in result for evaluation
+    result["vlm_areas"] = [
+        {
+            "name": a.get("name", ""),
+            "type": a.get("type", ""),
+            "bbox": a.get("bbox", {}),
+        }
+        for a in areas
+    ]
 
     # ── Stage 3: SAM3 Segmentation ────────────────────────────────────────
     logger.info(f"  Stage 3: SAM3 Segmentation ({len(areas)} regions)...")
@@ -876,6 +1058,7 @@ def process_single_image(
             masks, area_names, rgb_image, bboxes_used,
             output_dir / folder_name, image_id,
             depth_image=depth_image, input_mode=input_mode,
+            vlm_areas=result.get("vlm_areas"),
         )
 
     if config["output"].get("save_individual_json", True):
@@ -897,20 +1080,39 @@ def run_pipeline(config: Dict):
     strategy = config["pipeline"]["strategy"]
     input_mode = config["pipeline"].get("input_mode", "rgb_depth_separate")
 
-    # Output directory: {strategy}/{model_tag}/{input_mode}_sam3/
+    # Output directory: {strategy}/{model_tag}/{input_mode}/
     r_name = config["model"]["reasoner"]["name"]
     e_name = config["model"].get("evaluator", {}).get("name", r_name)
     mtag = _model_tag(strategy, r_name, e_name if strategy == "two_vlm" else None)
     suffix = config["pipeline"].get("output_suffix", "")
 
-    output_dir = Path(config["output"]["dir"]) / strategy / mtag / f"{input_mode}_sam3"
+    output_dir = Path(config["output"]["dir"]) / strategy / mtag / input_mode
     if suffix:
-        output_dir = Path(config["output"]["dir"]) / f"{strategy}{suffix}" / mtag / f"{input_mode}_sam3"
+        output_dir = Path(config["output"]["dir"]) / f"{strategy}{suffix}" / mtag / input_mode
+
+    # Close any file handlers pointing into output_dir BEFORE cleaning
+    root_logger = logging.getLogger()
+    for h in root_logger.handlers[:]:
+        if isinstance(h, logging.FileHandler):
+            try:
+                if hasattr(h, "baseFilename") and output_dir.resolve() in Path(h.baseFilename).resolve().parents:
+                    h.close()
+                    root_logger.removeHandler(h)
+            except (OSError, ValueError):
+                pass
 
     if config["pipeline"].get("clean_output", False) and output_dir.exists():
         logger.info(f"Cleaning output directory: {output_dir}")
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Set up file logging inside the run output directory
+    log_dir = output_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    fh = logging.FileHandler(log_dir / f"pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logging.getLogger().addHandler(fh)
+
     logger.info(f"Output directory: {output_dir}")
 
     # Save config
@@ -1098,6 +1300,14 @@ Examples:
                         help="Specific folder names to process")
     parser.add_argument("--quick_test", action="store_true",
                         help="Quick test: 3 images per folder")
+    parser.add_argument("--num_images", type=int, default=None,
+                        help="Number of images per folder to process (overrides quick_test)")
+
+    # SAM3 segmentation mode
+    parser.add_argument("--sam3_input_mode", type=str, default=None,
+                        choices=["text_only", "bbox_only", "text_and_bbox"],
+                        help="SAM3 input mode: text_only (VLM text), bbox_only (VLM bbox), "
+                             "text_and_bbox (both). Default: text_only")
 
     # Output
     parser.add_argument("--prompt_dir", type=str, default=None,
@@ -1170,11 +1380,21 @@ def merge_args(config: Dict, args: argparse.Namespace) -> Dict:
     if getattr(args, "quick_test", False):
         config["pipeline"]["num_images_per_folder"] = 3
 
+    if getattr(args, "num_images", None):
+        config["pipeline"]["num_images_per_folder"] = args.num_images
+
     if getattr(args, "few_shot_dir", None):
         config["pipeline"]["few_shot_dir"] = args.few_shot_dir
+    elif config["pipeline"].get("strategy") == "few_shot" and getattr(args, "gt_dir", None):
+        # Default: use GT annotations as few-shot examples
+        config["pipeline"]["few_shot_dir"] = args.gt_dir
+        logger.info(f"Few-shot: using GT directory as few-shot examples: {args.gt_dir}")
 
     if getattr(args, "num_examples", None):
         config["pipeline"]["num_examples"] = args.num_examples
+
+    if getattr(args, "sam3_input_mode", None):
+        config["model"]["segmentation"]["sam3_input_mode"] = args.sam3_input_mode
 
     if getattr(args, "clean", False):
         config["pipeline"]["clean_output"] = True
@@ -1190,8 +1410,9 @@ def merge_args(config: Dict, args: argparse.Namespace) -> Dict:
 # ---------------------------------------------------------------------------
 
 def main():
-    _work_dir = os.environ.get("WORK", str(Path(__file__).parent.parent))
-    os.environ.setdefault("HF_HOME", os.path.join(_work_dir, ".cache", "huggingface"))
+    # Use $WORK with hardcoded fallback to the woody directory (where models are cached)
+    _work_dir = os.environ.get("WORK", "/home/woody/iwnt/iwnt164h")
+    os.environ["HF_HOME"] = os.path.join(_work_dir, ".cache", "huggingface")
 
     args = parse_args()
 
@@ -1215,22 +1436,14 @@ def main():
     if args.prompt_dir:
         set_prompt_dir(Path(args.prompt_dir))
 
-    # Setup logging to file
+    # Print config summary
     strategy = config["pipeline"]["strategy"]
+    input_mode = config["pipeline"].get("input_mode", "rgb_depth_separate")
     r_name = config["model"]["reasoner"]["name"]
     e_name = config["model"].get("evaluator", {}).get("name", r_name)
     mtag = _model_tag(strategy, r_name, e_name if strategy == "two_vlm" else None)
     global _LOG_MODEL_NAME
     _LOG_MODEL_NAME = mtag
-
-    log_dir = Path(_WORK_DIR) / "free_ground_results" / f"{strategy}_{mtag}" / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    fh = logging.FileHandler(log_dir / f"pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    logging.getLogger().addHandler(fh)
-
-    # Print config summary
-    input_mode = config["pipeline"].get("input_mode", "rgb_depth_separate")
     logger.info("=" * 60)
     logger.info("Unified Free Ground Space Detection Pipeline")
     logger.info("=" * 60)
@@ -1245,6 +1458,7 @@ def main():
         logger.info(f"Few-shot dir: {config['pipeline'].get('few_shot_dir', 'NOT SET')}")
         logger.info(f"Num examples: {config['pipeline'].get('num_examples', 3)}")
     logger.info(f"Segmentation: SAM3 ({config['model']['segmentation'].get('sam3_model_id', 'facebook/sam3')})")
+    logger.info(f"SAM3 mode:    {config['model']['segmentation'].get('sam3_input_mode', 'text_only')}")
 
     run_pipeline(config)
 

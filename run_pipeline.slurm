@@ -34,6 +34,8 @@ REASONER=""
 EVALUATOR=""
 MODE=""
 FEW_SHOT_DIR=""
+SAM3_MODE=""
+NUM_IMAGES=""
 CLEAN_FLAG=""
 DRY_RUN=false
 RUN_ALL=false
@@ -46,6 +48,8 @@ while [[ $# -gt 0 ]]; do
         --reasoner)   shift; REASONER="$1" ;;
         --evaluator)  shift; EVALUATOR="$1" ;;
         --mode)       shift; MODE="$1" ;;
+        --sam3_input_mode) shift; SAM3_MODE="$1" ;;
+        --num_images) shift; NUM_IMAGES="$1" ;;
         --few_shot_dir) shift; FEW_SHOT_DIR="$1" ;;
         --clean)      CLEAN_FLAG="--clean" ;;
         --dry-run)    DRY_RUN=true ;;
@@ -62,29 +66,30 @@ submit_job() {
     local mode="$3"
     local extra_args="${4:-}"
 
-    # Choose partition based on model + strategy
-    local partition gpu_spec time_limit
-    if [[ "$model" == *"gemma"* ]]; then
-        partition="v100"
-        gpu_spec="gpu:v100:1"
-        time_limit="20:00:00"
-    elif [[ "$strategy" == "few_shot" ]]; then
-        # Few-shot needs more VRAM (3 example images in prompt) → use v100
-        partition="v100"
-        gpu_spec="gpu:v100:1"
-        time_limit="20:00:00"
-    else
-        partition="rtx3080"
-        gpu_spec="gpu:1"
-        time_limit="20:00:00"
+    # Append SAM3 mode if specified
+    if [[ -n "$SAM3_MODE" ]]; then
+        extra_args="$extra_args --sam3_input_mode $SAM3_MODE"
     fi
 
+    # Append num_images if specified
+    if [[ -n "$NUM_IMAGES" ]]; then
+        extra_args="$extra_args --num_images $NUM_IMAGES"
+    fi
+
+    # Choose partition based on model + strategy
+    local partition gpu_spec time_limit
+    # All jobs use v100
+    partition="v100"
+    gpu_spec="gpu:v100:1"
+    time_limit="20:00:00"
+
     # Short name for job
-    local short_model=$(echo "$model" | sed 's/Qwen2.5-VL-7B-Instruct/Qwen/' | sed 's/gemma-4-E4B-it/Gemma/')
+    local short_model=$(echo "$model" | sed 's/Qwen2.5-VL-7B-Instruct/Qwen/' | sed 's/gemma-4-E4B-it/Gemma/' | sed 's|Qwen/Qwen3.5-2B|Qwen3.5-2B|')
     local job_name="fg_${strategy}_${short_model}_${mode}"
+    local run_dir="$RESULTS_DIR/$strategy/$short_model/$mode"
     local log_out="$RESULTS_DIR/slurm_logs/${job_name}_%j.out"
 
-    local wrap_cmd="export HF_HOME=$WORK_DIR/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $SCRIPT_DIR && $PY lac_pipeline.py --strategy $strategy --model $model --input_mode $mode --prompt_dir prompts_navigable --gt_dir $GT_DIR $extra_args $CLEAN_FLAG"
+    local wrap_cmd="export HF_HOME=$WORK_DIR/.cache/huggingface && cd $SCRIPT_DIR && $PY lac_pipeline.py --strategy $strategy --model $model --input_mode $mode --prompt_dir prompts_navigable --gt_dir $GT_DIR $extra_args $CLEAN_FLAG"
 
     if $DRY_RUN; then
         echo "DRY-RUN:"
@@ -119,24 +124,26 @@ submit_two_vlm_job() {
     local evaluator="$2"
     local mode="$3"
 
-    # Partition based on the LARGER model (may need to load both)
+    # All jobs use v100
     local partition gpu_spec time_limit
-    if [[ "$reasoner" == *"gemma"* ]] || [[ "$evaluator" == *"gemma"* ]]; then
-        partition="v100"
-        gpu_spec="gpu:v100:1"
-        time_limit="20:00:00"
-    else
-        partition="rtx3080"
-        gpu_spec="gpu:1"
-        time_limit="20:00:00"
-    fi
+    partition="v100"
+    gpu_spec="gpu:v100:1"
+    time_limit="20:00:00"
 
-    local r_short=$(echo "$reasoner" | sed 's/Qwen2.5-VL-7B-Instruct/Qwen/' | sed 's/gemma-4-E4B-it/Gemma/')
-    local e_short=$(echo "$evaluator" | sed 's/Qwen2.5-VL-7B-Instruct/Qwen/' | sed 's/gemma-4-E4B-it/Gemma/')
+    local r_short=$(echo "$reasoner" | sed 's/Qwen2.5-VL-7B-Instruct/Qwen/' | sed 's/gemma-4-E4B-it/Gemma/' | sed 's|Qwen/Qwen3.5-2B|Qwen3.5-2B|')
+    local e_short=$(echo "$evaluator" | sed 's/Qwen2.5-VL-7B-Instruct/Qwen/' | sed 's/gemma-4-E4B-it/Gemma/' | sed 's|Qwen/Qwen3.5-2B|Qwen3.5-2B|')
     local job_name="fg_two_vlm_${r_short}_${e_short}_${mode}"
+    local run_dir="$RESULTS_DIR/two_vlm/${r_short}_${e_short}/$mode"
     local log_out="$RESULTS_DIR/slurm_logs/${job_name}_%j.out"
 
-    local wrap_cmd="export HF_HOME=$WORK_DIR/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $SCRIPT_DIR && $PY lac_pipeline.py --strategy two_vlm --reasoner_model $reasoner --evaluator_model $evaluator --input_mode $mode --prompt_dir prompts_navigable --gt_dir $GT_DIR $CLEAN_FLAG"
+    local extra_args=""
+    if [[ -n "$SAM3_MODE" ]]; then
+        extra_args="$extra_args --sam3_input_mode $SAM3_MODE"
+    fi
+    if [[ -n "$NUM_IMAGES" ]]; then
+        extra_args="$extra_args --num_images $NUM_IMAGES"
+    fi
+    local wrap_cmd="export HF_HOME=$WORK_DIR/.cache/huggingface && cd $SCRIPT_DIR && $PY lac_pipeline.py --strategy two_vlm --reasoner_model $reasoner --evaluator_model $evaluator --input_mode $mode --prompt_dir prompts_navigable --gt_dir $GT_DIR $extra_args $CLEAN_FLAG"
 
     if $DRY_RUN; then
         echo "DRY-RUN:"

@@ -34,25 +34,26 @@ DATA_DIR = WORK_DIR / "mlp_dataset" / "prospthesisproject-Data" / "Code" / "Data
 
 def find_runs(results_dir: Path) -> List[Path]:
     """Find all pipeline run directories."""
+    VALID_MODES = {"rgb_only", "rgb_depth_separate"}
+    skip_dirs = {"slurm_logs", "logs", "evaluation", "comparison", "evaluation_v2",
+                 "comparison_v2", "Annotated_Ground_Truth"}
     runs = []
     for strategy_dir in sorted(results_dir.iterdir()):
-        if not strategy_dir.is_dir() or strategy_dir.name in ("slurm_logs", "evaluation", "comparison"):
+        if not strategy_dir.is_dir() or strategy_dir.name in skip_dirs:
             continue
         for model_dir in sorted(strategy_dir.iterdir()):
             if not model_dir.is_dir():
                 continue
             for mode_dir in sorted(model_dir.iterdir()):
-                if not mode_dir.is_dir() or not mode_dir.name.endswith("_sam3"):
+                if not mode_dir.is_dir() or mode_dir.name not in VALID_MODES:
                     continue
                 runs.append(mode_dir)
     return runs
 
 
 def get_input_mode(dir_name: str) -> str:
-    """Extract input_mode from directory name like 'rgb_only_sam3'."""
-    if dir_name.startswith("rgb_depth_separate"):
-        return "rgb_depth_separate"
-    return "rgb_only"
+    """Extract input_mode from directory name."""
+    return dir_name  # Now just the mode name directly (rgb_only or rgb_depth_separate)
 
 
 def generate_for_run(run_dir: Path, dry_run: bool) -> dict:

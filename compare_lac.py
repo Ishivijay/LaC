@@ -36,7 +36,7 @@ DEFAULT_GT_MASK_DIR = WORK_DIR / "mlp_ground_truth" / "proper_annotations"
 DEFAULT_DATA_DIR = (
     WORK_DIR / "mlp_dataset" / "prospthesisproject-Data" / "Code" / "Data"
 )
-DEFAULT_OUTPUT_DIR = WORK_DIR / "free_ground_results" / "comparison"
+DEFAULT_OUTPUT_DIR = WORK_DIR / "free_ground_results" / "comparison_v2"
 
 STRATEGIES = ["zero_shot", "few_shot", "two_vlm"]
 MODELS = ["Qwen", "Gemma"]
@@ -62,13 +62,20 @@ def discover_gt_annotations(gt_mask_dir: Path) -> Dict[str, tuple]:
 
 
 def discover_runs(results_dir: Path) -> List[Dict]:
-    """Discover all pipeline runs from the results directory."""
+    """Discover all pipeline runs from the results directory.
+
+    Scans: {results_dir}/{strategy}/{model_tag}/{input_mode}/
+    """
     runs = []
     if not results_dir.exists():
         return runs
 
-    skip_dirs = {"slurm_logs", "logs", "evaluation", "comparison",
-                 "lac_navigable_evaluation", "lac_navigable_comparison"}
+    VALID_MODES = {"rgb_only", "rgb_depth_separate"}
+    skip_dirs = {"slurm_logs", "logs", "evaluation", "comparison", "evaluation_v2",
+                 "comparison_v2", "Annotated_Ground_Truth",
+                 "lac_navigable_evaluation", "lac_navigable_comparison",
+                 "lac_navigable_evaluation_v2", "lac_navigable_comparison_v2"}
+
     for strategy_dir in sorted(results_dir.iterdir()):
         if not strategy_dir.is_dir() or strategy_dir.name in skip_dirs:
             continue
@@ -80,9 +87,9 @@ def discover_runs(results_dir: Path) -> List[Dict]:
             model_tag = model_dir.name
 
             for mode_dir in sorted(model_dir.iterdir()):
-                if not mode_dir.is_dir() or not mode_dir.name.endswith("_sam3"):
+                if not mode_dir.is_dir() or mode_dir.name not in VALID_MODES:
                     continue
-                input_mode = mode_dir.name.replace("_sam3", "")
+                input_mode = mode_dir.name
 
                 parts = model_tag.split("_")
                 reasoner_model = parts[0]
@@ -305,7 +312,7 @@ def generate_comparison_visualizations(all_evals: Dict[str, List[Dict]], output_
     plt.close()
 
     # 2. Metric heatmap
-    metrics_to_show = ["iou", "precision", "recall", "f1", "dice"]
+    metrics_to_show = ["iou", "precision", "recall", "f1", "accuracy"]
     fig, ax = plt.subplots(figsize=(10, max(4, len(shorts) * 0.8)))
     data = np.array([[np.mean([e[m] for e in all_evals[s]]) for m in metrics_to_show] for s in shorts])
     im = ax.imshow(data, cmap="YlGn", aspect="auto", vmin=0, vmax=max(0.5, data.max()))
@@ -322,6 +329,89 @@ def generate_comparison_visualizations(all_evals: Dict[str, List[Dict]], output_
     plt.tight_layout()
     plt.savefig(vis_dir / "metric_heatmap.png", dpi=150)
     plt.close()
+
+    # 3. Strategy comparison: 4 approaches across metrics
+    # Group: zero_shot, few_shot, two_vlm (same), two_vlm (diff)
+    strategy_groups = {
+        "Zero-Shot\n(1 VLM)": [],
+        "Few-Shot\n(1 VLM + examples)": [],
+        "Two-VLM\n(same model)": [],
+        "Two-VLM\n(different models)": [],
+    }
+    for short, evals in all_evals.items():
+        if not evals:
+            continue
+        strategy = evals[0].get("strategy", "")
+        model_tag = evals[0].get("model_tag", "")
+        if strategy == "zero_shot":
+            strategy_groups["Zero-Shot\n(1 VLM)"].extend(evals)
+        elif strategy == "few_shot":
+            strategy_groups["Few-Shot\n(1 VLM + examples)"].extend(evals)
+        elif strategy == "two_vlm":
+            if "_" in model_tag:  # e.g., "Qwen_Gemma"
+                strategy_groups["Two-VLM\n(different models)"].extend(evals)
+            else:
+                strategy_groups["Two-VLM\n(same model)"].extend(evals)
+
+    # Filter empty groups
+    strategy_groups = {k: v for k, v in strategy_groups.items() if v}
+
+    if strategy_groups:
+        strat_metrics = ["iou", "precision", "recall", "f1", "accuracy"]
+        strat_names = list(strategy_groups.keys())
+        strat_data = {}
+        for metric in strat_metrics:
+            strat_data[metric] = []
+            for name in strat_names:
+                evals = strategy_groups[name]
+                strat_data[metric].append(np.mean([e[metric] for e in evals]) if evals else 0)
+
+        x = np.arange(len(strat_names))
+        width = 0.13
+        strat_colors = ["#2196F3", "#4CAF50", "#FF9800", "#9C27B0", "#F44336"]
+
+        fig, ax = plt.subplots(figsize=(14, 7))
+        for i, metric in enumerate(strat_metrics):
+            offset = (i - len(strat_metrics) / 2 + 0.5) * width
+            bars = ax.bar(x + offset, strat_data[metric], width,
+                          label=metric.upper(), color=strat_colors[i], alpha=0.85,
+                          edgecolor="black", linewidth=0.5)
+            for bar, val in zip(bars, strat_data[metric]):
+                if val > 0.01:
+                    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
+                            f"{val:.3f}", ha="center", fontsize=7, rotation=45)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(strat_names, fontsize=10)
+        ax.set_ylabel("Score")
+        ax.set_title("Strategy Comparison: Zero-Shot vs Few-Shot vs Two-VLM (same) vs Two-VLM (diff)")
+        ax.legend(loc="upper right", fontsize=9)
+        ax.set_ylim(0, max(max(v) for v in strat_data.values()) * 1.2 + 0.05)
+        ax.grid(axis="y", alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(vis_dir / "strategy_comparison.png", dpi=150)
+        plt.close()
+
+        # 4. Radar/spider chart for strategy comparison
+        angles = np.linspace(0, 2 * np.pi, len(strat_metrics), endpoint=False).tolist()
+        angles += angles[:1]
+
+        fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(polar=True))
+        radar_colors = ["#2196F3", "#4CAF50", "#FF9800", "#9C27B0"]
+        for i, name in enumerate(strat_names):
+            values = [strat_data[m][i] for m in strat_metrics]
+            values += values[:1]
+            ax.plot(angles, values, "o-", linewidth=2, label=name.replace("\n", " "),
+                    color=radar_colors[i % len(radar_colors)])
+            ax.fill(angles, values, alpha=0.1, color=radar_colors[i % len(radar_colors)])
+
+        ax.set_xticks(angles[:-1])
+        ax.set_xticklabels([m.upper() for m in strat_metrics], fontsize=10)
+        ax.set_title("Strategy Comparison (Radar)", fontsize=12, pad=20)
+        ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1), fontsize=8)
+        plt.tight_layout()
+        plt.savefig(vis_dir / "strategy_radar.png", dpi=150)
+        plt.close()
 
     print(f"Charts saved to {vis_dir}")
 

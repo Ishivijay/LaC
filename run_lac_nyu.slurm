@@ -4,30 +4,17 @@
 # ──────────────────────────────────────────────────────────────────────────────
 #
 # Runs YOUR ORIGINAL lac_pipeline.py on the NYU Depth V2 test set.
-# Steps:
-#   1. Prepares NYU data into lms_kamal_* format (symlinks + depth conversion)
-#   2. Extracts floor ground truth masks from NYU labeled data
-#   3. Runs the original lac_pipeline.py
-#   4. Evaluates results against floor GT
+# Uses sbatch --wrap to dynamically set partition and GPU type.
 #
 # Usage:
-#   sbatch run_lac_nyu.slurm
-#   sbatch run_lac_nyu.slurm --quick-test
-#   sbatch run_lac_nyu.slurm --strategy zero_shot --mode rgb_only
-#   sbatch run_lac_nyu.slurm --model Qwen2.5-VL-7B-Instruct
-#   sbatch run_lac_nyu.slurm --prepare-only   # Just prepare data, don't run pipeline
+#   bash run_lac_nyu.slurm
+#   bash run_lac_nyu.slurm --quick-test
+#   bash run_lac_nyu.slurm --strategy zero_shot --mode rgb_only
+#   bash run_lac_nyu.slurm --model gemma-4-E4B-it
+#   bash run_lac_nyu.slurm --prepare-only
+#   bash run_lac_nyu.slurm --all   # Run all combinations
 #
 # ──────────────────────────────────────────────────────────────────────────────
-
-#SBATCH --job-name=lac_nyu
-#SBATCH --output=/home/woody/iwnt/iwnt164h/nyu_lac_results/slurm_logs/%j.out
-#SBATCH --error=/home/woody/iwnt/iwnt164h/nyu_lac_results/slurm_logs/%j.err
-#SBATCH --time=12:00:00
-#SBATCH --partition=rtx3080
-## #SBATCH --partition=v100
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
-
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -36,18 +23,21 @@ PY="$WORK_DIR/venvs/marigold/bin/python3"
 RESULTS_DIR="$WORK_DIR/nyu_lac_results"
 GT_DIR="$WORK_DIR/nyu_testset_gt/floor_masks"
 NYU_DIR="$WORK_DIR/nyu_testset"
+LAC_DIR="$SCRIPT_DIR"
 
 mkdir -p "$RESULTS_DIR/slurm_logs"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 STRATEGY="two_vlm"
 MODEL="Qwen2.5-VL-7B-Instruct"
-MODE="rgb_depth_separate"
+MODE="rgb_only"
 NUM_IMAGES=""
 QUICK_TEST=false
 PREPARE_ONLY=false
 EVALUATE=true
 CLEAN_FLAG=""
+DRY_RUN=false
+RUN_ALL=false
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -61,26 +51,34 @@ while [[ $# -gt 0 ]]; do
         --evaluate)       EVALUATE=true ;;
         --no-evaluate)    EVALUATE=false ;;
         --clean)          CLEAN_FLAG="--clean" ;;
+        --dry-run)        DRY_RUN=true ;;
+        --all)            RUN_ALL=true ;;
+        --partition)      shift; PARTITION_OVERRIDE="$1" ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
     shift
 done
 
-echo "============================================================"
-echo "LAC Pipeline — NYU Depth V2 Test Set"
-echo "============================================================"
-echo "Job ID:        $SLURM_JOB_ID"
-echo "Node:          $SLURMD_NODENAME"
-echo "Strategy:      $STRATEGY"
-echo "Model:         $MODEL"
-echo "Input mode:    $MODE"
-echo "Python:        $PY"
-echo "============================================================"
+# ── Select partition and GPU ─────────────────────────────────────────────────
+if [[ -n "${PARTITION_OVERRIDE:-}" ]]; then
+    PARTITION="$PARTITION_OVERRIDE"
+    if [[ "$PARTITION" == "v100" ]]; then
+        GPU_SPEC="gpu:v100:1"
+    else
+        GPU_SPEC="gpu:1"
+    fi
+    TIME_LIMIT="12:00:00"
+elif [[ "$MODEL" == "gemma-4-E4B-it" ]]; then
+    PARTITION="v100"
+    GPU_SPEC="gpu:v100:1"
+    TIME_LIMIT="05:00:00"
+else
+    PARTITION="rtx3080"
+    GPU_SPEC="gpu:1"
+    TIME_LIMIT="12:00:00"
+fi
 
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || true
-
-# ── Step 1: Prepare NYU data ─────────────────────────────────────────────────
-echo ""
+# ── Prepare data (runs locally, not on cluster) ──────────────────────────────
 echo "============================================================"
 echo "Step 1: Preparing NYU data for LAC pipeline..."
 echo "============================================================"
@@ -100,7 +98,7 @@ if [ "$PREPARE_ONLY" = true ]; then
     exit 0
 fi
 
-# ── Step 2: Extract floor GT masks ───────────────────────────────────────────
+# ── Extract floor GT masks (if not already done) ─────────────────────────────
 if [ ! -d "$GT_DIR" ] || [ -z "$(ls -A "$GT_DIR" 2>/dev/null)" ]; then
     echo ""
     echo "============================================================"
@@ -114,75 +112,117 @@ else
     echo "Floor GT masks already exist — skipping extraction."
 fi
 
-# ── Step 3: Run original LAC pipeline ────────────────────────────────────────
-echo ""
-echo "============================================================"
-echo "Step 3: Running original LAC pipeline..."
-echo "============================================================"
+# ── Build pipeline command ────────────────────────────────────────────────────
+build_pipeline_cmd() {
+    local strategy="$1"
+    local model="$2"
+    local mode="$3"
 
-PIPELINE_CMD="$PY $SCRIPT_DIR/lac_pipeline.py \
-    --config $SCRIPT_DIR/nyu_lac_config.yaml \
-    --strategy $STRATEGY \
-    --model $MODEL \
-    --input_mode $MODE"
+    local cmd="export HF_HOME=$WORK_DIR/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $LAC_DIR && $PY lac_pipeline.py --config nyu_lac_config.yaml --strategy $strategy --model $model --input_mode $mode"
 
-if [ "$QUICK_TEST" = true ]; then
-    PIPELINE_CMD="$PIPELINE_CMD --quick_test"
-fi
+    if [ -n "$NUM_IMAGES" ]; then
+        cmd="$cmd --num_images $NUM_IMAGES"
+    fi
+    if [ "$QUICK_TEST" = true ]; then
+        cmd="$cmd --quick_test"
+    fi
+    if [ -n "$CLEAN_FLAG" ]; then
+        cmd="$cmd $CLEAN_FLAG"
+    fi
 
-if [ -n "$CLEAN_FLAG" ]; then
-    PIPELINE_CMD="$PIPELINE_CMD $CLEAN_FLAG"
-fi
+    # Add evaluation step after pipeline
+    if [ "$EVALUATE" = true ]; then
+        local short_model=""
+        case "$model" in
+            Qwen2.5-VL-7B-Instruct) short_model="Qwen" ;;
+            gemma-4-E4B-it) short_model="Gemma" ;;
+            *) short_model="$model" ;;
+        esac
+        local result_dir="$RESULTS_DIR/$strategy/$short_model/${mode}_sam3"
+        cmd="$cmd && $PY $LAC_DIR/evaluate_lac_nyu.py --results_dir $result_dir --gt_mask_dir $GT_DIR --output_dir $result_dir/evaluation"
+    fi
 
-echo "Command: $PIPELINE_CMD"
-echo ""
+    echo "$cmd"
+}
 
-eval $PIPELINE_CMD
+# ── Submit jobs ───────────────────────────────────────────────────────────────
+submit_job() {
+    local strategy="$1"
+    local model="$2"
+    local mode="$3"
 
-echo ""
-echo "============================================================"
-echo "Pipeline complete! Results in: $RESULTS_DIR"
-echo "============================================================"
+    # Select partition based on model
+    local partition="$PARTITION"
+    local gpu_spec="$GPU_SPEC"
+    local time_limit="$TIME_LIMIT"
+    if [[ "$model" == "gemma-4-E4B-it" ]]; then
+        partition="v100"
+        gpu_spec="gpu:v100:1"
+        time_limit="05:00:00"
+    else
+        partition="rtx3080"
+        gpu_spec="gpu:1"
+        time_limit="12:00:00"
+    fi
 
-# ── Step 4: Evaluate ─────────────────────────────────────────────────────────
-if [ "$EVALUATE" = true ]; then
-    echo ""
-    echo "============================================================"
-    echo "Step 4: Evaluating against floor ground truth..."
-    echo "============================================================"
-
-    # Find the results directory for this run
-    # Structure: {strategy}/{model_tag}/{input_mode}_sam3/
-    SHORT_MODEL=""
-    case "$MODEL" in
-        Qwen2.5-VL-7B-Instruct) SHORT_MODEL="Qwen" ;;
-        gemma-4-E4B-it) SHORT_MODEL="Gemma" ;;
-        *) SHORT_MODEL="$MODEL" ;;
+    local short_model=""
+    case "$model" in
+        Qwen2.5-VL-7B-Instruct) short_model="Qwen" ;;
+        gemma-4-E4B-it) short_model="Gemma" ;;
+        *) short_model="$model" ;;
     esac
 
-    RESULT_SUBDIR="$RESULTS_DIR/$STRATEGY/$SHORT_MODEL/${MODE}_sam3"
-    if [ -d "$RESULT_SUBDIR" ]; then
-        $PY "$SCRIPT_DIR/evaluate_lac_nyu.py" \
-            --results_dir "$RESULT_SUBDIR" \
-            --gt_mask_dir "$GT_DIR" \
-            --output_dir "$RESULT_SUBDIR/evaluation"
+    local job_name="lac_nyu_${short_model}_${mode}"
+    local log_out="$RESULTS_DIR/slurm_logs/${job_name}_%j.out"
+    local log_err="$RESULTS_DIR/slurm_logs/${job_name}_%j.err"
+    local wrap_cmd=$(build_pipeline_cmd "$strategy" "$model" "$mode")
+
+    if $DRY_RUN; then
+        echo "  [DRY RUN] sbatch \\"
+        echo "    --partition=${partition} \\"
+        echo "    --gres=${gpu_spec} \\"
+        echo "    --time=${time_limit} \\"
+        echo "    --job-name=${job_name} \\"
+        echo "    --output=${log_out} \\"
+        echo "    --error=${log_err} \\"
+        echo "    --cpus-per-task=4 \\"
+        echo "    --wrap=\"${wrap_cmd}\""
+        echo ""
     else
-        echo "Results directory not found: $RESULT_SUBDIR"
-        echo "Trying to auto-detect..."
-        # Try to find the latest results
-        LATEST=$(find "$RESULTS_DIR" -name "all_results.csv" -type f -newer "$RESULTS_DIR" 2>/dev/null | head -1)
-        if [ -n "$LATEST" ]; then
-            FOUND_DIR=$(dirname "$LATEST")
-            echo "Found: $FOUND_DIR"
-            $PY "$SCRIPT_DIR/evaluate_lac_nyu.py" \
-                --results_dir "$FOUND_DIR" \
-                --gt_mask_dir "$GT_DIR" \
-                --output_dir "$FOUND_DIR/evaluation"
-        else
-            echo "ERROR: Could not find results to evaluate."
-        fi
+        JOB_ID=$(sbatch \
+            --partition="${partition}" \
+            --gres="${gpu_spec}" \
+            --time="${time_limit}" \
+            --job-name="${job_name}" \
+            --output="${log_out}" \
+            --error="${log_err}" \
+            --cpus-per-task=4 \
+            --wrap="${wrap_cmd}" \
+            | awk '{print $NF}')
+        echo "  Submitted ${short_model} ${mode}: Job $JOB_ID (partition=${partition}, gres=${gpu_spec})"
     fi
+}
+
+echo ""
+echo "============================================================"
+echo "Step 3: Submitting LAC pipeline jobs..."
+echo "============================================================"
+
+if $RUN_ALL; then
+    echo "Running ALL combinations..."
+    for strategy in two_vlm zero_shot; do
+        for model in Qwen2.5-VL-7B-Instruct gemma-4-E4B-it; do
+            for mode in rgb_only rgb_depth_separate; do
+                submit_job "$strategy" "$model" "$mode"
+            done
+        done
+    done
+else
+    submit_job "$STRATEGY" "$MODEL" "$MODE"
 fi
 
 echo ""
-echo "All done! Job $SLURM_JOB_ID complete."
+echo "============================================================"
+echo "Jobs submitted! Monitor with: squeue -u \$USER"
+echo "Results will be in: $RESULTS_DIR"
+echo "============================================================"

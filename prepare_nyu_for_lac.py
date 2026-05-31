@@ -78,6 +78,7 @@ def nyu_depth_to_colored(depth_raw: np.ndarray) -> np.ndarray:
 def prepare_nyu_dataset(
     nyu_dir: Path,
     output_base: Path,
+    colored_depth_dir: Path = None,
     num_images: int = None,
     force: bool = False,
 ):
@@ -88,13 +89,12 @@ def prepare_nyu_dataset(
             sharpen_rgb/PNG/
                 image000.png ... image653.png  (symlinks to NYU RGB)
             marigold_zero_shot/depth_colored/
-                image000_depth_colored.png ...  (converted from NYU depth)
+                image000_depth_colored.png ...  (symlinks to existing colored depth)
     """
     rgb_dir = nyu_dir / "rgb"
-    depth_dir = nyu_dir / "depth"
 
-    if not rgb_dir.exists() or not depth_dir.exists():
-        logger.error(f"NYU directories not found: {rgb_dir}, {depth_dir}")
+    if not rgb_dir.exists():
+        logger.error(f"NYU RGB directory not found: {rgb_dir}")
         return False
 
     # Create output structure
@@ -117,6 +117,13 @@ def prepare_nyu_dataset(
     logger.info(f"  RGB → {out_rgb}")
     logger.info(f"  Depth → {out_depth}")
 
+    # Check for pre-existing colored depth maps
+    use_existing_colored = colored_depth_dir and colored_depth_dir.exists()
+    if use_existing_colored:
+        logger.info(f"  Using existing colored depth maps from: {colored_depth_dir}")
+    else:
+        logger.info("  Converting raw depth to colored (no existing colored depth dir provided)")
+
     created_rgb = 0
     created_depth = 0
 
@@ -133,28 +140,41 @@ def prepare_nyu_dataset(
             rgb_link.symlink_to(rgb_path.resolve())
         created_rgb += 1
 
-        # ── Convert depth ───────────────────────────────────────────
-        depth_src = depth_dir / f"{nyu_id}.png"
+        # ── Depth ───────────────────────────────────────────────────
         depth_dst = out_depth / f"{image_id}_depth_colored.png"
 
-        if depth_src.exists() and (force or not depth_dst.exists()):
-            # Read raw depth
-            depth_raw = cv2.imread(str(depth_src), cv2.IMREAD_UNCHANGED)
-            if depth_raw is None:
-                depth_pil = Image.open(depth_src)
-                depth_raw = np.array(depth_pil)
+        if force and depth_dst.exists():
+            depth_dst.unlink()
 
-            if depth_raw is not None:
-                colored = nyu_depth_to_colored(depth_raw)
-                cv2.imwrite(str(depth_dst), colored)
-                created_depth += 1
+        if not depth_dst.exists():
+            if use_existing_colored:
+                # Symlink existing colored depth map
+                existing_colored = colored_depth_dir / f"{nyu_id}_depth_colored.png"
+                if existing_colored.exists():
+                    depth_dst.symlink_to(existing_colored.resolve())
+                    created_depth += 1
+                else:
+                    logger.warning(f"No colored depth for {nyu_id}")
             else:
-                logger.warning(f"Failed to read depth: {depth_src}")
+                # Convert raw depth to colored
+                depth_src = nyu_dir / "depth" / f"{nyu_id}.png"
+                if depth_src.exists():
+                    depth_raw = cv2.imread(str(depth_src), cv2.IMREAD_UNCHANGED)
+                    if depth_raw is None:
+                        depth_pil = Image.open(depth_src)
+                        depth_raw = np.array(depth_pil)
+
+                    if depth_raw is not None:
+                        colored = nyu_depth_to_colored(depth_raw)
+                        cv2.imwrite(str(depth_dst), colored)
+                        created_depth += 1
+                    else:
+                        logger.warning(f"Failed to read depth: {depth_src}")
 
         if (i + 1) % 50 == 0:
             logger.info(f"  Processed {i+1}/{len(rgb_files)}")
 
-    logger.info(f"Created {created_rgb} RGB symlinks, {created_depth} colored depth maps")
+    logger.info(f"Created {created_rgb} RGB symlinks, {created_depth} depth links/maps")
     logger.info(f"NYU folder: {nyu_folder}")
 
     return True
@@ -249,6 +269,11 @@ def main():
         help="Base output directory (default: $WORK)",
     )
     parser.add_argument(
+        "--colored_depth_dir", type=str,
+        default="/home/woody/iwnt/iwnt164h/nyu_test/prediction/depth_colored",
+        help="Directory with existing colored depth maps (nyu_XXXX_depth_colored.png)",
+    )
+    parser.add_argument(
         "--num_images", type=int, default=None,
         help="Prepare only N images (for testing)",
     )
@@ -261,6 +286,7 @@ def main():
     work_dir = args.output_base or os.environ.get("WORK", "/home/woody/iwnt/iwnt164h")
     output_base = Path(work_dir)
     nyu_dir = Path(args.nyu_dir)
+    colored_depth_dir = Path(args.colored_depth_dir) if args.colored_depth_dir else None
 
     logger.info("=" * 60)
     logger.info("Preparing NYU Depth V2 for LAC Pipeline")
@@ -269,7 +295,7 @@ def main():
     logger.info(f"Output base:  {output_base}")
 
     # Step 1: Prepare dataset
-    success = prepare_nyu_dataset(nyu_dir, output_base, args.num_images, args.force)
+    success = prepare_nyu_dataset(nyu_dir, output_base, colored_depth_dir, args.num_images, args.force)
 
     if not success:
         logger.error("Failed to prepare dataset")
