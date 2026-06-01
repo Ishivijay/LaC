@@ -93,3 +93,75 @@ sbatch --partition=work --gres=gpu:1 --time=02:00:00 \
   --output=$WORK/free_ground_results/slurm_logs/lac_cmp_sam3_%j.out \
   --wrap="cd $HOME/lac_free_ground && python3 compare_lac.py --seg_method sam3"
 
+
+---for lac pipeline 
+1. Two-VLM (same model) — Qwen3.5-2B as both reasoner and evaluator:
+
+bash lac_free_ground/run_pipeline.slurm --strategy two_vlm --model Qwen/Qwen3.5-2B --mode rgb_depth_separate --num_images 5 --sam3_input_mode bbox_only
+
+2. Two-VLM (different models) — Qwen3.5-2B as reasoner + Qwen2.5-VL-7B as evaluator:
+
+bash lac_free_ground/run_pipeline.slurm --strategy two_vlm --reasoner Qwen/Qwen3.5-2B --evaluator Qwen2.5-VL-7B-Instruct --mode rgb_depth_separate --num_images 5 --sam3_input_mode bbox_only
+
+3. Two-VLM (different, reversed) — Qwen2.5-VL-7B as reasoner + Qwen3.5-2B as evaluator:
+
+bash lac_free_ground/run_pipeline.slurm --strategy two_vlm --reasoner Qwen2.5-VL-7B-Instruct --evaluator Qwen/Qwen3.5-2B --mode rgb_depth_separate --num_images 5 --sam3_input_mode bbox_only
+ 
+bash lac_free_ground/run_pipeline.slurm --strategy zero_shot --model Qwen/Qwen3-VL-4B-Instruct --mode rgb_depth_separate --num_images 5 --sam3_input_mode bbox_only
+
+Qwen/Qwen3-VL-4B-Instruct
+
+ByteDance/Sa2VA-Qwen3-VL-4B
+
+
+# Set cache path
+export HF_HOME=$WORK/.cache/huggingface
+
+# Download model weights + processor
+python3 -c "
+from huggingface_hub import snapshot_download
+snapshot_download('ByteDance/Sa2VA-Qwen3-VL-4B', repo_type='model')
+print('Model downloaded successfully')
+"
+
+
+
+bash lac_free_ground/run_sa2va_segmentation.slurm \
+  --base-dir $WORK/mlp_dataset/prospthesisproject-Data/Code/Data \
+  --output-root $WORK/free_ground_results \
+  --input-mode rgb_depth_separate
+
+bash lac_free_ground/run_sa2va_segmentation.slurm --base-dir $WORK/mlp_dataset/prospthesisproject-Data/Code/Data --output-root $WORK/free_ground_results --input-mode rgb_depth_separate --folders lms_kamal_LA_downstairs_Nopeople_1 --num-images 5 --image-max-side 896
+
+
+
+
+
+python3 /home/hpc/iwnt/iwnt164h/lac_free_ground/visualize_vlm_bboxes.py --image_path /home/woody/iwnt/iwnt164h/mlp_dataset/prospthesisproject-Data/Code/Data/lms_kamal_LA_downstairs_Nopeople_1/sharpen_rgb/PNG/image22.png --annotations_json '[{"polygon":[[568,266],[584,617],[642,593],[1000,684],[1000,115],[852,242]],"label":"free walkable area"}]' --output_path /home/woody/iwnt/iwnt164h/mlp_dataset/prospthesisproject-Data/Code/Data/lms_kamal_LA_downstairs_Nopeople_1/sharpen_rgb/PNG/image22_viz.png
+
+
+python3 /home/hpc/iwnt/iwnt164h/lac_free_ground/visualize_vlm_bboxes.py --image_path /home/woody/iwnt/iwnt164h/mlp_dataset/prospthesisproject-Data/Code/Data/lms_kamal_LA_downstairs_Nopeople_1/sharpen_rgb/PNG/image202.png --bbox_json '{"x1":6.25,"y1":80.19,"x2":99.43,"y2":100.0}' --output_path /home/woody/iwnt/iwnt164h/mlp_dataset/prospthesisproject-Data/Code/Data/lms_kamal_LA_downstairs_Nopeople_1/sharpen_rgb/PNG/image202_viz.png
+
+
+
+
+bash lac_free_ground/run_sa2va_segmentation.slurm \
+  --base-dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations \
+  --input-mode rgb_only \
+  --output-root $WORK/free_ground_results \
+  --strategy sa2va \
+  --model-tag Sa2VA-Qwen3-VL-4B \
+  --num-images 0 \
+  --partition a100 \
+  --gres gpu:a100:1
+
+bash lac_free_ground/run_sa2va_segmentation.slurm \
+  --base-dir /home/woody/iwnt/iwnt164h/mlp_dataset/prospthesisproject-Data/Code/Data \
+  --input-mode rgb_only \
+  --gt-dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations \
+  --output-root $WORK/free_ground_results \
+  --strategy sa2va \
+  --model-tag Sa2VA-Qwen3-VL-4B \
+  --num-images 0 \
+  --partition a100 \
+  --gres gpu:a100:1

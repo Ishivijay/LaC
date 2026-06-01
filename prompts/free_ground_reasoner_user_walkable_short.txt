@@ -1,0 +1,29 @@
+<image>Analyze this indoor scene and identify all walkable areas safe for traversal.
+
+INCLUDE: floors, staircases, ramps, walkways, corridors, and any other surfaces safe for walking.
+EXCLUDE: walls, furniture, obstacles, drop-offs, and unsafe surfaces.
+
+For each walkable area, provide:
+- name: type of surface (e.g., "floor", "staircase", "ramp")
+- position: location in image
+- bbox: bounding box as percentages (0-100)
+
+Return your answer in JSON format:
+{
+    "description": "Brief description of the environment",
+    "walkable_areas": [
+        {
+            "name": "floor",
+            "position": "bottom-center",
+            "bbox": {"x1": 5, "y1": 60, "x2": 95, "y2": 100},
+            "reasoning": "Tile floor extending across bottom portion"
+        },
+        {
+            "name": "staircase",
+            "position": "center",
+            "bbox": {"x1": 30, "y1": 30, "x2": 70, "y2": 60},
+            "reasoning": "Stairs leading upward, clearly visible steps"
+        }
+    ],
+    "obstacles": ["furniture", "walls"]
+}

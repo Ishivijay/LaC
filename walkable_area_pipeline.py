@@ -80,11 +80,15 @@ from pipeline import (
 # ---------------------------------------------------------------------------
 
 SHORT_MODEL_NAMES = {
-    "Qwen2.5-VL-7B-Instruct": "Qwen",
-    "gemma-4-E4B-it": "Gemma",
+    "Qwen2.5-VL-7B-Instruct": "Qwen2.5-VL-7B",
+    "Qwen3.5-2B": "Qwen3.5-2B",
+    "Qwen3-VL-4B-Instruct": "Qwen3-VL-4B",
+    "gemma-4-E4B-it": "Gemma-4-E4B",
+    "ByteDance/Sa2VA-Qwen3-VL-4B": "Sa2VA-Qwen3-VL-4B",
+    "Sa2VA-Qwen3-VL-4B": "Sa2VA-Qwen3-VL-4B",
 }
 
-STRATEGIES = ["zero_shot", "few_shot", "two_vlm"]
+STRATEGIES = ["zero_shot", "few_shot", "two_vlm", "sa2va"]
 INPUT_MODES = ["rgb_only", "rgb_depth_separate"]
 
 
@@ -129,19 +133,19 @@ def run_free_ground_reasoner(
     model, processor, config: Dict, rgb_image: Image.Image,
     depth_image: Optional[Image.Image], model_config: Dict = None,
 ) -> Dict:
-    """Run the reasoner VLM to identify free ground areas."""
+    """Run the reasoner VLM to identify walkable areas safe for traversal."""
     input_mode = config["pipeline"].get("input_mode", "rgb_depth_separate")
-    system_prompt = load_prompt("free_ground_reasoner_system.txt")
+    system_prompt = load_prompt("free_ground_reasoner_system_walkable_short.txt")
 
     if input_mode == "rgb_depth_separate" and depth_image is not None:
-        user_prompt = load_prompt("free_ground_reasoner_user_depth.txt")
+        user_prompt = load_prompt("free_ground_reasoner_user_depth_walkable_short.txt")
         user_content = [
             {"type": "text", "text": user_prompt},
             {"type": "image", "image": rgb_image},
             {"type": "image", "image": depth_image},
         ]
     else:
-        user_prompt = load_prompt("free_ground_reasoner_user.txt")
+        user_prompt = load_prompt("free_ground_reasoner_user_walkable_short.txt")
         user_content = [
             {"type": "text", "text": user_prompt},
             {"type": "image", "image": rgb_image},
@@ -166,27 +170,424 @@ def parse_reasoner_output(response: str) -> Dict:
 
     try:
         result = json.loads(cleaned)
+        # Support both new 'walkable_areas' and old 'free_ground_areas' keys
         if isinstance(result, list):
-            return {"free_ground_areas": result, "navigability_reasoning": "", "obstacles": []}
-        return result
+            return {"walkable_areas": result, "navigability_reasoning": "", "obstacles": []}
+        
+        # Normalize to walkable_areas
+        if "walkable_areas" in result:
+            areas = result["walkable_areas"]
+        elif "free_ground_areas" in result:
+            areas = result["free_ground_areas"]
+        else:
+            areas = []
+        
+        return {
+            "description": result.get("description", ""),
+            "walkable_areas": areas,
+            "navigability_reasoning": result.get("navigability_reasoning", ""),
+            "obstacles": result.get("obstacles", []),
+            "raw_response": response,
+        }
     except json.JSONDecodeError:
         json_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if json_match:
             try:
                 result = json.loads(json_match.group())
                 if isinstance(result, list):
-                    return {"free_ground_areas": result, "navigability_reasoning": "", "obstacles": []}
-                return result
+                    return {"walkable_areas": result, "navigability_reasoning": "", "obstacles": []}
+                
+                # Normalize to walkable_areas
+                if "walkable_areas" in result:
+                    areas = result["walkable_areas"]
+                elif "free_ground_areas" in result:
+                    areas = result["free_ground_areas"]
+                else:
+                    areas = []
+                
+                return {
+                    "description": result.get("description", ""),
+                    "walkable_areas": areas,
+                    "navigability_reasoning": result.get("navigability_reasoning", ""),
+                    "obstacles": result.get("obstacles", []),
+                    "raw_response": response,
+                }
             except json.JSONDecodeError:
                 pass
 
     return {
         "description": "",
-        "free_ground_areas": [],
+        "walkable_areas": [],
         "navigability_reasoning": cleaned[:500],
         "obstacles": [],
         "raw_response": response,
     }
+
+
+# ---------------------------------------------------------------------------
+# SA2VA Strategy Functions (direct segmentation, no SAM3)
+# ---------------------------------------------------------------------------
+
+def _local_sa2va_model_path(model_id: str) -> Optional[Path]:
+    """Find the local cached path for a SA2VA model."""
+    _work_dir = os.environ.get("WORK", str(Path(__file__).parent.parent))
+    hf_cache = Path(_work_dir) / ".cache" / "huggingface"
+    cache_dir = hf_cache / "hub" / f"models--{model_id.replace('/', '--')}" / "snapshots"
+    if not cache_dir.exists():
+        return None
+
+    snapshots = sorted([p for p in cache_dir.iterdir() if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True)
+    for snapshot in snapshots:
+        if (snapshot / "config.json").exists():
+            return snapshot
+    return snapshots[0] if snapshots else None
+
+
+def load_sa2va_model(model_id: str, device: str):
+    """Load SA2VA model and processor."""
+    import torch
+    from transformers import AutoModel, AutoProcessor
+    from transformers.modeling_utils import PreTrainedModel
+
+    if not hasattr(PreTrainedModel, "all_tied_weights_keys"):
+        PreTrainedModel.all_tied_weights_keys = {}
+
+    dtype = torch.bfloat16 if device.startswith("cuda") and torch.cuda.is_available() else torch.float32
+    local_model_path = _local_sa2va_model_path(model_id)
+    model_source = str(local_model_path) if local_model_path is not None else model_id
+    model = AutoModel.from_pretrained(
+        model_source,
+        torch_dtype=dtype,
+        low_cpu_mem_usage=True,
+        trust_remote_code=True,
+        local_files_only=local_model_path is not None,
+    ).eval()
+    if device != "cpu":
+        model = model.to(device)
+    processor = AutoProcessor.from_pretrained(
+        model_source,
+        trust_remote_code=True,
+        use_fast=False,
+        local_files_only=local_model_path is not None,
+    )
+    return model, processor
+
+
+def _run_sa2va_model(model, processor, image: Optional[Image.Image], prompt: str, device: str, video: Optional[List[Image.Image]] = None):
+    """Run SA2VA model inference."""
+    import torch
+    
+    input_dict = {
+        "image": image,
+        "video": list(video) if video is not None else None,
+        "text": prompt,
+        "past_text": "",
+        "mask_prompts": None,
+        "processor": processor,
+    }
+    with torch.no_grad():
+        return_dict = model.predict_forward(**input_dict)
+    prediction = return_dict.get("prediction", "")
+    masks = return_dict.get("prediction_masks", []) or []
+    labels = return_dict.get("prediction_labels", []) or []
+    return prediction, masks, labels
+
+
+def _mask_to_bool(mask) -> np.ndarray:
+    """Convert mask to boolean array."""
+    arr = np.asarray(mask)
+    if arr.ndim == 3 and arr.shape[0] > 1:
+        arr = arr[0]
+    arr = np.squeeze(arr)
+    if arr.ndim > 2:
+        arr = arr.reshape(arr.shape[-2], arr.shape[-1])
+    if arr.dtype != bool:
+        arr = arr > 0.5
+    return arr.astype(bool)
+
+
+def _resize_mask(mask: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
+    """Resize mask to target size."""
+    width, height = size
+    mask = np.asarray(mask)
+    if mask.ndim == 3 and mask.shape[0] > 1:
+        mask = mask[0]
+    mask = np.squeeze(mask)
+    if mask.ndim > 2:
+        mask = mask.reshape(mask.shape[-2], mask.shape[-1])
+    if mask.shape == (height, width):
+        return mask
+    mask_img = Image.fromarray((mask.astype(np.uint8) * 255))
+    mask_img = mask_img.resize((width, height), Image.NEAREST)
+    return np.array(mask_img) > 127
+
+
+def _mask_bbox(mask: np.ndarray) -> Optional[Dict[str, int]]:
+    """Get bounding box of mask in pixels."""
+    ys, xs = np.where(mask)
+    if len(xs) == 0 or len(ys) == 0:
+        return None
+    return {
+        "x1": int(xs.min()),
+        "y1": int(ys.min()),
+        "x2": int(xs.max()) + 1,
+        "y2": int(ys.max()) + 1,
+    }
+
+
+def _bbox_percent(bbox: Optional[Dict[str, int]], size: Tuple[int, int]) -> Optional[Dict[str, float]]:
+    """Convert pixel bbox to percentage coordinates."""
+    if bbox is None:
+        return None
+    width, height = size
+    return {
+        "x1": round(bbox["x1"] / width * 100, 2),
+        "y1": round(bbox["y1"] / height * 100, 2),
+        "x2": round(bbox["x2"] / width * 100, 2),
+        "y2": round(bbox["y2"] / height * 100, 2),
+    }
+
+
+def _prepare_sa2va_inputs(rgb_image: Image.Image, depth_image: Optional[Image.Image], input_mode: str, max_side: int = 896) -> Tuple[Optional[Image.Image], Optional[List[Image.Image]]]:
+    """Prepare SA2VA model inputs from RGB and depth images."""
+    def _resize_max_side(image: Image.Image, max_side: int) -> Image.Image:
+        if max_side <= 0:
+            return image
+        width, height = image.size
+        longest_side = max(width, height)
+        if longest_side <= max_side:
+            return image
+        scale = max_side / float(longest_side)
+        new_width = max(1, int(round(width * scale)))
+        new_height = max(1, int(round(height * scale)))
+        return image.resize((new_width, new_height), Image.LANCZOS)
+
+    if input_mode == "rgb_only" or depth_image is None:
+        return _resize_max_side(rgb_image.convert("RGB"), max_side), None
+
+    if input_mode == "rgb_depth_separate":
+        rgb_frame = _resize_max_side(rgb_image.convert("RGB"), max_side)
+        depth_frame = _resize_max_side(depth_image.convert("RGB"), max_side)
+        if depth_frame.size != rgb_frame.size:
+            depth_frame = depth_frame.resize(rgb_frame.size, Image.NEAREST)
+        return None, [rgb_frame, depth_frame]
+
+    return None, None
+
+
+def _load_sa2va_prompt(input_mode: str) -> str:
+    """Load SA2VA walkable prompts from prompt files."""
+    prompt_dir = Path(__file__).parent / "prompts"
+    
+    if input_mode == "rgb_only":
+        prompt_file = prompt_dir / "sa2va_walkable_short.txt"
+    else:
+        prompt_file = prompt_dir / "sa2va_walkable_depth_short.txt"
+    
+    if prompt_file.exists():
+        return prompt_file.read_text()
+    
+    # Fallback to inline prompts if files don't exist
+    if input_mode == "rgb_only":
+        return "<image>Segment all walkable areas safe for traversal in this indoor scene.\n\nINCLUDE: floors, staircases, ramps, walkways, corridors, and any other surfaces safe for walking.\nEXCLUDE: walls, furniture, obstacles, drop-offs, and unsafe surfaces.\n\nReturn segmentation masks for all walkable areas."
+    return (
+        "<image>Segment all walkable areas safe for traversal using both RGB and depth images.\n\nINCLUDE: floors, staircases, ramps, walkways, corridors, and any other surfaces safe for walking.\nEXCLUDE: walls, furniture, obstacles, drop-offs, and unsafe surfaces.\n\nDepth cues: \n- Floors: smooth, gradually changing depth colors\n- Stairs: distinct horizontal bands showing step depth progression\n- Ramps: continuous gradient of depth colors\n- Obstacles: sharp depth transitions or no depth data\n\nReturn segmentation masks for all walkable areas in the RGB image."
+    )
+
+
+def process_sa2va_image(
+    rgb_path: Path,
+    depth_path: Optional[Path],
+    image_id: str,
+    folder_name: str,
+    model,
+    processor,
+    config: Dict,
+    output_dir: Path,
+) -> Dict:
+    """Process a single image with SA2VA model."""
+    import torch
+    from PIL import ImageDraw, ImageFont
+    from datetime import datetime
+    
+    input_mode = config["pipeline"].get("input_mode", "rgb_depth_separate")
+    device = config["pipeline"].get("device", "cuda" if torch.cuda.is_available() else "cpu")
+    max_side = config["pipeline"].get("image_max_side", 896)
+    
+    # Load images
+    rgb_image = load_image_for_vlm(rgb_path)
+    depth_image = None
+    if input_mode != "rgb_only" and depth_path:
+        depth_image = load_image_for_vlm(depth_path)
+    
+    # Prepare model inputs
+    model_image, model_video = _prepare_sa2va_inputs(rgb_image, depth_image, input_mode, max_side)
+    
+    # Load prompt
+    prompt = _load_sa2va_prompt(input_mode)
+    
+    # Run SA2VA model
+    prediction, masks, labels = _run_sa2va_model(model, processor, model_image, prompt, device, video=model_video)
+    
+    # Prepare output directory
+    folder_dir = output_dir / folder_name
+    mask_dir = folder_dir / "masks"
+    mask_dir.mkdir(parents=True, exist_ok=True)
+    
+    rgb_arr = np.array(rgb_image.convert("RGB"))
+    h, w = rgb_arr.shape[:2]
+    overlay = rgb_arr.copy()
+    colors = [
+        (0, 255, 0),
+        (0, 128, 255),
+        (255, 0, 255),
+        (255, 255, 0),
+        (0, 255, 255),
+        (255, 128, 0),
+    ]
+    
+    areas: List[Dict] = []
+    saved_masks: List[np.ndarray] = []
+    
+    for idx, mask in enumerate(masks):
+        mask_bool = _mask_to_bool(mask)
+        # Project mask back to RGB size
+        mask_bool = _resize_mask(mask_bool, (w, h))
+        bbox_px = _mask_bbox(mask_bool)
+        if bbox_px is None:
+            continue
+        
+        name = labels[idx] if idx < len(labels) and labels[idx] else f"sa2va_area_{idx}"
+        safe_name = re.sub(r"[^\w]", "_", name)[:30]
+        base = f"{image_id}_mask_{len(saved_masks)}_{safe_name}"
+        
+        # Save mask
+        mask_img = Image.fromarray((mask_bool.astype(np.uint8) * 255))
+        mask_img.save(mask_dir / f"{base}.png")
+        np.save(mask_dir / f"{base}.npy", mask_bool)
+        
+        # Create overlay
+        color = colors[len(saved_masks) % len(colors)]
+        color_mask = np.zeros((h, w, 3), dtype=np.uint8)
+        color_mask[mask_bool] = color
+        overlay[mask_bool] = (overlay[mask_bool] * 0.5 + color_mask[mask_bool] * 0.5).astype(np.uint8)
+        
+        areas.append({
+            "name": name,
+            "type": "sa2va_mask",
+            "bbox": _bbox_percent(bbox_px, (w, h)),
+            "bbox_pixels": bbox_px,
+            "area_pixels": int(mask_bool.sum()),
+        })
+        saved_masks.append(mask_bool)
+    
+    # Save segmentation overlay
+    Image.fromarray(overlay).save(mask_dir / f"{image_id}_segmentation_overlay.png")
+    
+    # Build consolidated image
+    consolidated = _build_sa2va_consolidated_image(rgb_image, depth_image, areas, overlay, input_mode)
+    consolidated.save(folder_dir / f"{image_id}_consolidated.png")
+    
+    # Prepare result
+    model_id = config["model"].get("sa2va", {}).get("hf_model_id", "unknown")
+    model_tag = _model_tag("sa2va", model_id.split("/")[-1] if "/" in model_id else model_id)
+    
+    result = {
+        "folder": folder_name,
+        "image_id": image_id,
+        "strategy": "sa2va",
+        "model_tag": model_tag,
+        "model_id": model_id,
+        "input_mode": input_mode,
+        "segmentation_method": "sa2va",
+        "timestamp": datetime.now().isoformat(),
+        "prompt": prompt,
+        "prediction": prediction,
+        "num_masks": len(saved_masks),
+        "walkable_areas": areas,
+    }
+    
+    # Save JSON result
+    with open(folder_dir / f"{image_id}_lac_analysis.json", "w") as f:
+        json.dump(result, f, indent=2, default=str)
+    
+    # Save all masks together
+    if saved_masks:
+        np.save(folder_dir / f"{image_id}_sa2va_masks.npy", np.stack(saved_masks, axis=0))
+    
+    return result
+
+
+def _build_sa2va_consolidated_image(
+    rgb_image: Image.Image,
+    depth_image: Optional[Image.Image],
+    areas: List[Dict],
+    overlay: np.ndarray,
+    input_mode: str,
+) -> Image.Image:
+    """Build consolidated visualization image for SA2VA results."""
+    from PIL import ImageDraw, ImageFont
+    
+    rgb_arr = np.array(rgb_image.convert("RGB"))
+    h, w = rgb_arr.shape[:2]
+    label_h = 30
+    gap = 4
+    
+    panels: List[Tuple[str, np.ndarray]] = [("Original RGB", rgb_arr)]
+    
+    if input_mode != "rgb_only" and depth_image is not None:
+        depth_rgb = np.array(depth_image.convert("RGB"))
+        if depth_rgb.shape[:2] != (h, w):
+            depth_rgb = np.array(depth_image.convert("RGB").resize((w, h), Image.NEAREST))
+        panels.append(("Depth Map", depth_rgb))
+    
+    if areas:
+        panels.append(("SA2VA BBox", _draw_sa2va_bbox_panel(rgb_arr, areas)))
+    
+    panels.append(("Segmentation", overlay))
+    
+    total_w = sum(panel.shape[1] for _, panel in panels) + gap * (len(panels) - 1)
+    total_h = h + label_h
+    canvas = np.full((total_h, total_w, 3), 255, dtype=np.uint8)
+    
+    x_offset = 0
+    for label, panel in panels:
+        canvas[0:label_h, x_offset:x_offset + panel.shape[1]] = (40, 40, 40)
+        label_img = Image.fromarray(canvas)
+        draw = ImageDraw.Draw(label_img)
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
+        except (OSError, IOError):
+            font = ImageFont.load_default()
+        draw.text((x_offset + 8, 7), label, fill=(255, 255, 255), font=font)
+        canvas = np.array(label_img)
+        canvas[label_h:, x_offset:x_offset + panel.shape[1]] = panel
+        x_offset += panel.shape[1] + gap
+    
+    return Image.fromarray(canvas)
+
+
+def _draw_sa2va_bbox_panel(rgb_array: np.ndarray, areas: List[Dict]) -> np.ndarray:
+    """Draw bounding boxes on RGB array."""
+    panel = rgb_array.copy()
+    h, w = panel.shape[:2]
+    for idx, area in enumerate(areas):
+        bbox = area.get("bbox", {})
+        x1 = int(round(bbox["x1"] / 100 * w))
+        y1 = int(round(bbox["y1"] / 100 * h))
+        x2 = int(round(bbox["x2"] / 100 * w))
+        y2 = int(round(bbox["y2"] / 100 * h))
+        color = (0, 255, 0)
+        try:
+            import cv2
+            cv2.rectangle(panel, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(panel, area.get("name", f"mask_{idx}"), (x1 + 3, max(18, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        except Exception:
+            panel[y1:y2, x1:x1 + 2] = color
+            panel[y1:y2, max(0, x2 - 2):x2] = color
+            panel[y1:y1 + 2, x1:x2] = color
+            panel[max(0, y2 - 2):y2, x1:x2] = color
+    return panel
 
 
 # ---------------------------------------------------------------------------
@@ -1075,20 +1476,27 @@ def process_single_image(
 # ---------------------------------------------------------------------------
 
 def run_pipeline(config: Dict):
-    """Run the unified free ground detection pipeline."""
+    """Run the unified walkable area detection pipeline."""
     start_time = time.time()
     strategy = config["pipeline"]["strategy"]
     input_mode = config["pipeline"].get("input_mode", "rgb_depth_separate")
 
-    # Output directory: {strategy}/{model_tag}/{input_mode}/
-    r_name = config["model"]["reasoner"]["name"]
-    e_name = config["model"].get("evaluator", {}).get("name", r_name)
-    mtag = _model_tag(strategy, r_name, e_name if strategy == "two_vlm" else None)
+    # Output directory: {strategy}/{model_tag}/{input_mode}_{method}/
+    if strategy == "sa2va":
+        sa2va_name = config["model"]["sa2va"]["name"]
+        mtag = SHORT_MODEL_NAMES.get(sa2va_name, sa2va_name)
+        method = "sa2va"
+    else:
+        r_name = config["model"]["reasoner"]["name"]
+        e_name = config["model"].get("evaluator", {}).get("name", r_name)
+        mtag = _model_tag(strategy, r_name, e_name if strategy == "two_vlm" else None)
+        method = "sam3"
+    
     suffix = config["pipeline"].get("output_suffix", "")
 
-    output_dir = Path(config["output"]["dir"]) / strategy / mtag / input_mode
+    output_dir = Path(config["output"]["dir"]) / strategy / mtag / f"{input_mode}_{method}"
     if suffix:
-        output_dir = Path(config["output"]["dir"]) / f"{strategy}{suffix}" / mtag / input_mode
+        output_dir = Path(config["output"]["dir"]) / f"{strategy}{suffix}" / mtag / f"{input_mode}_{method}"
 
     # Close any file handlers pointing into output_dir BEFORE cleaning
     root_logger = logging.getLogger()
@@ -1130,47 +1538,60 @@ def run_pipeline(config: Dict):
     logger.info(f"Loading models for strategy: {strategy}")
     logger.info("=" * 60)
 
-    # Reasoner model (always needed)
-    reasoner_config = {"model": config["model"]["reasoner"]}
-    reasoner_model, reasoner_proc = load_vlm_model(reasoner_config)
-    models = {"reasoner": (reasoner_model, reasoner_proc)}
-
-    # Evaluator model (only for two_vlm)
-    if strategy == "two_vlm":
-        evaluator_config = {"model": config["model"]["evaluator"]}
-        if config["model"]["evaluator"]["hf_model_id"] == config["model"]["reasoner"]["hf_model_id"]:
-            logger.info("Reusing reasoner model for evaluator (same model)")
-            models["evaluator"] = (reasoner_model, reasoner_proc)
-        else:
-            logger.info(f"Loading separate evaluator model: {config['model']['evaluator']['name']}")
-            evaluator_model, evaluator_proc = load_vlm_model(evaluator_config)
-            models["evaluator"] = (evaluator_model, evaluator_proc)
-
-    # Few-shot samples (only for few_shot)
+    models = {}
     few_shot_samples = None
     few_shot_excluded = set()  # (folder, image_id) to exclude from test set
-    if strategy == "few_shot":
-        few_shot_dir = config["pipeline"].get("few_shot_dir")
-        num_examples = config["pipeline"].get("num_examples", 3)
-        if few_shot_dir:
-            few_shot_samples, few_shot_excluded = load_few_shot_samples(
-                few_shot_dir,
-                config["data"]["base_dir"],
-                config["data"]["rgb_subfolder"],
-                config["data"]["depth_subfolder"],
-                num_examples,
-            )
-            if not few_shot_samples:
-                logger.error("No few-shot samples loaded! Check --few_shot_dir path.")
-                return
-            logger.info(f"  Excluding {len(few_shot_excluded)} example images from test set")
-        else:
-            logger.error("--few_shot_dir is required for few_shot strategy")
-            return
 
-    # Pre-load SAM3
-    logger.info("Pre-loading SAM3 model...")
-    _load_sam3_model(config)
+    if strategy == "sa2va":
+        # Load SA2VA model
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        sa2va_config = config["model"]["sa2va"]
+        logger.info(f"Loading SA2VA model: {sa2va_config['hf_model_id']}")
+        sa2va_model, sa2va_proc = load_sa2va_model(sa2va_config["hf_model_id"], device)
+        models["sa2va"] = (sa2va_model, sa2va_proc)
+        config["pipeline"]["device"] = device
+    else:
+        # VLM strategies
+        # Reasoner model (always needed)
+        reasoner_config = {"model": config["model"]["reasoner"]}
+        reasoner_model, reasoner_proc = load_vlm_model(reasoner_config)
+        models["reasoner"] = (reasoner_model, reasoner_proc)
+
+        # Evaluator model (only for two_vlm)
+        if strategy == "two_vlm":
+            evaluator_config = {"model": config["model"]["evaluator"]}
+            if config["model"]["evaluator"]["hf_model_id"] == config["model"]["reasoner"]["hf_model_id"]:
+                logger.info("Reusing reasoner model for evaluator (same model)")
+                models["evaluator"] = (reasoner_model, reasoner_proc)
+            else:
+                logger.info(f"Loading separate evaluator model: {config['model']['evaluator']['name']}")
+                evaluator_model, evaluator_proc = load_vlm_model(evaluator_config)
+                models["evaluator"] = (evaluator_model, evaluator_proc)
+
+        # Few-shot samples (only for few_shot)
+        if strategy == "few_shot":
+            few_shot_dir = config["pipeline"].get("few_shot_dir")
+            num_examples = config["pipeline"].get("num_examples", 3)
+            if few_shot_dir:
+                few_shot_samples, few_shot_excluded = load_few_shot_samples(
+                    few_shot_dir,
+                    config["data"]["base_dir"],
+                    config["data"]["rgb_subfolder"],
+                    config["data"]["depth_subfolder"],
+                    num_examples,
+                )
+                if not few_shot_samples:
+                    logger.error("No few-shot samples loaded! Check --few_shot_dir path.")
+                    return
+                logger.info(f"  Excluding {len(few_shot_excluded)} example images from test set")
+            else:
+                logger.error("--few_shot_dir is required for few_shot strategy")
+                return
+
+        # Pre-load SAM3
+        logger.info("Pre-loading SAM3 model...")
+        _load_sam3_model(config)
 
     # ── Process images ────────────────────────────────────────────────────
     all_results = []
@@ -1201,10 +1622,19 @@ def run_pipeline(config: Dict):
                 continue
 
             try:
-                result = process_single_image(
-                    rgb_path, depth_path, str(image_id), folder.name,
-                    models, config, output_dir, few_shot_samples,
-                )
+                if strategy == "sa2va":
+                    # Use SA2VA processing
+                    sa2va_model, sa2va_proc = models["sa2va"]
+                    result = process_sa2va_image(
+                        rgb_path, depth_path, str(image_id), folder.name,
+                        sa2va_model, sa2va_proc, config, output_dir,
+                    )
+                else:
+                    # Use VLM processing
+                    result = process_single_image(
+                        rgb_path, depth_path, str(image_id), folder.name,
+                        models, config, output_dir, few_shot_samples,
+                    )
                 all_results.append(result)
             except Exception as e:
                 logger.error(f"FAILED {folder.name}/{image_id}: {e}")
@@ -1243,7 +1673,7 @@ def _resolve_model_id(name_or_id: str) -> Tuple[str, str]:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Unified Free Ground Space Detection Pipeline",
+        description="Unified Walkable Area Detection Pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1261,24 +1691,31 @@ Examples:
   python lac_pipeline.py --strategy two_vlm \\
       --reasoner_model Qwen2.5-VL-7B-Instruct --evaluator_model gemma-4-E4B-it \\
       --input_mode rgb_depth_separate
+
+  # SA2VA (direct segmentation)
+  python lac_pipeline.py --strategy sa2va --model ByteDance/Sa2VA-Qwen3-VL-4B --input_mode rgb_depth_separate
         """,
     )
     # Strategy
     parser.add_argument("--strategy", type=str, default="two_vlm",
                         choices=STRATEGIES,
-                        help="Pipeline strategy (default: two_vlm)")
+                        help="Pipeline strategy: zero_shot, few_shot, two_vlm, sa2va (default: two_vlm)")
     parser.add_argument("--config", type=str, default="lac_config.yaml",
                         help="Path to YAML config file")
 
-    # Model selection
+    # Model selection (VLM strategies)
     parser.add_argument("--model", type=str, default=None,
-                        help="Model for all VLM stages (name or HF ID)")
+                        help="Model for all VLM stages (name or HF ID), or SA2VA model for sa2va strategy")
     parser.add_argument("--reasoner_model", type=str, default=None,
-                        help="Reasoner model (overrides --model for reasoner)")
+                        help="Reasoner model (overrides --model for reasoner, VLM strategies only)")
     parser.add_argument("--evaluator_model", type=str, default=None,
                         help="Evaluator model (overrides --model for evaluator, two_vlm only)")
     parser.add_argument("--hf_model_id", type=str, default=None,
                         help="Override full HuggingFace model ID")
+
+    # SA2VA-specific
+    parser.add_argument("--image_max_side", type=int, default=896,
+                        help="Resize SA2VA input so longest side does not exceed this value (0 = keep original, default: 896)")
 
     # Input mode
     parser.add_argument("--input_mode", type=str, default=None,
@@ -1396,11 +1833,36 @@ def merge_args(config: Dict, args: argparse.Namespace) -> Dict:
     if getattr(args, "sam3_input_mode", None):
         config["model"]["segmentation"]["sam3_input_mode"] = args.sam3_input_mode
 
+    if getattr(args, "image_max_side", None):
+        config["pipeline"]["image_max_side"] = args.image_max_side
+
     if getattr(args, "clean", False):
         config["pipeline"]["clean_output"] = True
 
     if getattr(args, "output_suffix", None):
         config["pipeline"]["output_suffix"] = args.output_suffix
+
+    # Handle SA2VA model configuration
+    strategy = config["pipeline"].get("strategy", "two_vlm")
+    if strategy == "sa2va":
+        if getattr(args, "model", None):
+            name, hf_id = _resolve_model_id(args.model)
+            config["model"]["sa2va"] = {
+                "name": name,
+                "hf_model_id": hf_id,
+            }
+        elif getattr(args, "hf_model_id", None):
+            name = args.hf_model_id.split("/")[-1]
+            config["model"]["sa2va"] = {
+                "name": name,
+                "hf_model_id": args.hf_model_id,
+            }
+        # Set default SA2VA model if not specified
+        if "sa2va" not in config["model"]:
+            config["model"]["sa2va"] = {
+                "name": "Sa2VA-Qwen3-VL-4B",
+                "hf_model_id": "ByteDance/Sa2VA-Qwen3-VL-4B",
+            }
 
     return config
 
@@ -1445,20 +1907,26 @@ def main():
     global _LOG_MODEL_NAME
     _LOG_MODEL_NAME = mtag
     logger.info("=" * 60)
-    logger.info("Unified Free Ground Space Detection Pipeline")
+    logger.info("Unified Walkable Area Detection Pipeline")
     logger.info("=" * 60)
     logger.info(f"Strategy:     {strategy}")
     logger.info(f"Input mode:   {input_mode}")
-    logger.info(f"Reasoner:     {config['model']['reasoner']['name']}")
-    if strategy == "two_vlm":
-        logger.info(f"Evaluator:    {config['model']['evaluator']['name']}")
-        same = config["model"]["evaluator"]["hf_model_id"] == config["model"]["reasoner"]["hf_model_id"]
-        logger.info(f"Same model:   {same}")
-    if strategy == "few_shot":
-        logger.info(f"Few-shot dir: {config['pipeline'].get('few_shot_dir', 'NOT SET')}")
-        logger.info(f"Num examples: {config['pipeline'].get('num_examples', 3)}")
-    logger.info(f"Segmentation: SAM3 ({config['model']['segmentation'].get('sam3_model_id', 'facebook/sam3')})")
-    logger.info(f"SAM3 mode:    {config['model']['segmentation'].get('sam3_input_mode', 'text_only')}")
+    
+    if strategy == "sa2va":
+        sa2va_model_id = config["model"].get("sa2va", {}).get("hf_model_id", "unknown")
+        logger.info(f"SA2VA Model:  {sa2va_model_id}")
+        logger.info(f"Max side:     {config['pipeline'].get('image_max_side', 896)}")
+    else:
+        logger.info(f"Reasoner:     {config['model']['reasoner']['name']}")
+        if strategy == "two_vlm":
+            logger.info(f"Evaluator:    {config['model']['evaluator']['name']}")
+            same = config["model"]["evaluator"]["hf_model_id"] == config["model"]["reasoner"]["hf_model_id"]
+            logger.info(f"Same model:   {same}")
+        if strategy == "few_shot":
+            logger.info(f"Few-shot dir: {config['pipeline'].get('few_shot_dir', 'NOT SET')}")
+            logger.info(f"Num examples: {config['pipeline'].get('num_examples', 3)}")
+        logger.info(f"Segmentation: SAM3 ({config['model']['segmentation'].get('sam3_model_id', 'facebook/sam3')})")
+        logger.info(f"SAM3 mode:    {config['model']['segmentation'].get('sam3_input_mode', 'text_only')}")
 
     run_pipeline(config)
 

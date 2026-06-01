@@ -1,1 +1,0 @@
-Analyze this indoor scene and identify all flat floor areas safe for walking. Output strictly in the JSON format specified.

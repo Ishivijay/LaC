@@ -8,16 +8,16 @@ Think of it this way: "If I dropped a ball on this surface, would it stay there?
 - NO → It's NOT navigable (wall, window, railing — the ball would fall off)
 
 ## INCLUDE — Navigable Surfaces (horizontal, walkable)
-- ✅ **Flat ground / floor** — corridors, hallways, rooms, landings
-- ✅ **Stairs (going up or down)** — each step and the full staircase surface
-- ✅ **Stair landings** — flat platforms between flights of stairs
-- ✅ **Ramps** — if they are wide enough and in good condition
+- **Flat ground / floor** — corridors, hallways, rooms, landings
+- **Stairs (going up or down)** — each step and the full staircase surface
+- **Stair landings** — flat platforms between flights of stairs
+- **Ramps** — if they are wide enough and in good condition
 
 ## EXCLUDE — ALWAYS Obstacles (NEVER navigable)
 
 **THE FOLLOWING ARE VERTICAL OR NON-WALKABLE SURFACES — NEVER INCLUDE THEM:**
 
-- ❌ **WALLS** — ANY vertical surface on the sides of corridors, staircases, or rooms.
+- **WALLS** — ANY vertical surface on the sides of corridors, staircases, or rooms.
   Walls are NEVER walkable. If a surface is vertical (goes up from the floor), it is a WALL.
   Walls often appear as large colored/white/gray areas on the LEFT, RIGHT, or BACKGROUND of the image.
   **WALLS ARE THE #1 FALSE POSITIVE — ALWAYS CHECK if a detected area is actually a wall.**
@@ -27,21 +27,21 @@ Think of it this way: "If I dropped a ball on this surface, would it stay there?
   A wall does not become a floor just because something is mounted on it (railing, window, sign).
   If the surface is VERTICAL and attached to a wall, it is part of the WALL.
 
-- ❌ **WINDOWS** — glass surfaces, window frames, window sills, glass panels.
+- **WINDOWS** — glass surfaces, window frames, window sills, glass panels.
   Windows are VERTICAL glass surfaces — they are NEVER walkable.
   Windows often appear as bright rectangular areas with light coming through.
   **If you can see through it, it's a window — EXCLUDE it.**
   **The wall area below/around a window is still a wall — NOT navigable.**
 
-- ❌ **Railings / handrails** — metal or wooden barriers along stairs/corridors.
+- **Railings / handrails** — metal or wooden barriers along stairs/corridors.
   **The wall surface below a railing is still a wall — NOT a floor.**
   A railing mounted on a wall does NOT make the wall underneath it into a floor.
 
-- ❌ **Doors** — closed or open doors, door frames
-- ❌ **Furniture** — tables, chairs, benches, cabinets
-- ❌ **Columns / pillars** — structural supports
-- ❌ **Ceiling** — overhead surfaces
-- ❌ **Any object protruding into the walkable space** — signs, fire extinguishers, decorations
+- **Doors** — closed or open doors, door frames
+- **Furniture** — tables, chairs, benches, cabinets
+- **Columns / pillars** — structural supports
+- **Ceiling** — overhead surfaces
+- **Any object protruding into the walkable space** — signs, fire extinguishers, decorations
 
 ## SPATIAL RULES FOR IDENTIFYING NAVIGABLE AREAS
 
@@ -127,6 +127,3 @@ Think of it this way: "If I dropped a ball on this surface, would it stay there?
 - **BE CONSERVATIVE with area inclusion** — if unsure whether it's a wall or floor, DO NOT include it.
 - Only include areas large enough for a person to walk on.
 - If no navigable area exists, return an empty free_ground_areas list.
-
-## Previous free ground areas (for consistency):
-{prev_free_ground}

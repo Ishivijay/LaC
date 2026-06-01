@@ -1,0 +1,166 @@
+# Unified Walkable Area Detection - All Experiments
+# ===================================================
+# This file contains all commands to run experiments with different strategies,
+# models, and input modes for identifying walkable areas in indoor scenes.
+
+# Environment Variables (modify as needed)
+export WORK="${WORK:-/home/woody/iwnt/iwnt164h}"
+export DATA_DIR="${DATA_DIR:-/home/woody/iwnt/iwnt164h/mlp_dataset/prospthesisproject-Data/Code/Data}"
+export OUTPUT_DIR="$WORK/free_ground_results"
+
+# Pipeline script
+PIPELINE_SCRIPT="walkable_area_pipeline.py"
+
+# ==============================================================================
+# ZERO-SHOT EXPERIMENTS
+# ==============================================================================
+
+# Zero-shot with Qwen2.5-VL-7B-Instruct (RGB only)
+python $PIPELINE_SCRIPT --strategy zero_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_only
+
+# Zero-shot with Qwen2.5-VL-7B-Instruct (RGB + Depth)
+python $PIPELINE_SCRIPT --strategy zero_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate
+
+# Zero-shot with Qwen3.5-2B (RGB only)
+python $PIPELINE_SCRIPT --strategy zero_shot --model Qwen3.5-2B --input_mode rgb_only
+
+# Zero-shot with Qwen3.5-2B (RGB + Depth)
+python $PIPELINE_SCRIPT --strategy zero_shot --model Qwen3.5-2B --input_mode rgb_depth_separate
+
+# Zero-shot with Qwen3-VL-4B-Instruct (RGB only)
+python $PIPELINE_SCRIPT --strategy zero_shot --model Qwen3-VL-4B-Instruct --input_mode rgb_only
+
+# Zero-shot with Qwen3-VL-4B-Instruct (RGB + Depth)
+python $PIPELINE_SCRIPT --strategy zero_shot --model Qwen3-VL-4B-Instruct --input_mode rgb_depth_separate
+
+# Zero-shot with gemma-4-E4B-it (RGB only)
+python $PIPELINE_SCRIPT --strategy zero_shot --model gemma-4-E4B-it --input_mode rgb_only
+
+# Zero-shot with gemma-4-E4B-it (RGB + Depth)
+python $PIPELINE_SCRIPT --strategy zero_shot --model gemma-4-E4B-it --input_mode rgb_depth_separate
+
+# ==============================================================================
+# FEW-SHOT EXPERIMENTS
+# ==============================================================================
+
+# Few-shot with Qwen2.5-VL-7B-Instruct (RGB + Depth, 3 examples)
+python $PIPELINE_SCRIPT --strategy few_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate --few_shot_dir $DATA_DIR/annotations --num_examples 3
+
+# Few-shot with Qwen3.5-2B (RGB + Depth, 3 examples)
+python $PIPELINE_SCRIPT --strategy few_shot --model Qwen3.5-2B --input_mode rgb_depth_separate --few_shot_dir $DATA_DIR/annotations --num_examples 3
+
+# Few-shot with Qwen3-VL-4B-Instruct (RGB + Depth, 3 examples)
+python $PIPELINE_SCRIPT --strategy few_shot --model Qwen3-VL-4B-Instruct --input_mode rgb_depth_separate --few_shot_dir $DATA_DIR/annotations --num_examples 3
+
+# Few-shot with gemma-4-E4B-it (RGB + Depth, 3 examples)
+python $PIPELINE_SCRIPT --strategy few_shot --model gemma-4-E4B-it --input_mode rgb_depth_separate --few_shot_dir $DATA_DIR/annotations --num_examples 3
+
+# ==============================================================================
+# TWO-VLM EXPERIMENTS
+# ==============================================================================
+
+# Two-VLM with same model (Qwen2.5-VL-7B-Instruct, RGB + Depth)
+python $PIPELINE_SCRIPT --strategy two_vlm --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate
+
+# Two-VLM with same model (Qwen3.5-2B, RGB + Depth)
+python $PIPELINE_SCRIPT --strategy two_vlm --model Qwen3.5-2B --input_mode rgb_depth_separate
+
+# Two-VLM with same model (Qwen3-VL-4B-Instruct, RGB + Depth)
+python $PIPELINE_SCRIPT --strategy two_vlm --model Qwen3-VL-4B-Instruct --input_mode rgb_depth_separate
+
+# Two-VLM with same model (gemma-4-E4B-it, RGB + Depth)
+python $PIPELINE_SCRIPT --strategy two_vlm --model gemma-4-E4B-it --input_mode rgb_depth_separate
+
+# Two-VLM with different models (Qwen2.5-VL-7B-Instruct + gemma-4-E4B-it, RGB + Depth)
+python $PIPELINE_SCRIPT --strategy two_vlm --reasoner_model Qwen2.5-VL-7B-Instruct --evaluator_model gemma-4-E4B-it --input_mode rgb_depth_separate
+
+# Two-VLM with different models (Qwen3-VL-4B-Instruct + gemma-4-E4B-it, RGB + Depth)
+python $PIPELINE_SCRIPT --strategy two_vlm --reasoner_model Qwen3-VL-4B-Instruct --evaluator_model gemma-4-E4B-it --input_mode rgb_depth_separate
+
+# ==============================================================================
+# SA2VA EXPERIMENTS
+# ==============================================================================
+
+# SA2VA with ByteDance/Sa2VA-Qwen3-VL-4B (RGB only)
+python $PIPELINE_SCRIPT --strategy sa2va --model ByteDance/Sa2VA-Qwen3-VL-4B --input_mode rgb_only
+
+# SA2VA with ByteDance/Sa2VA-Qwen3-VL-4B (RGB + Depth)
+python $PIPELINE_SCRIPT --strategy sa2va --model ByteDance/Sa2VA-Qwen3-VL-4B --input_mode rgb_depth_separate
+
+# ==============================================================================
+# EVALUATION COMMANDS
+# ==============================================================================
+
+# Evaluate all results
+python evaluate_all.py --output_dir $OUTPUT_DIR
+
+# Compare different strategies
+python compare_strategies.py --output_dir $OUTPUT_DIR
+
+# Compare specific strategies
+python compare_strategies.py --output_dir $OUTPUT_DIR --strategies zero_shot sa2va
+
+# Compare specific models
+python compare_strategies.py --output_dir $OUTPUT_DIR --models Qwen2.5-VL-7B-Instruct Qwen3.5-2B
+
+# ==============================================================================
+# QUICK TEST COMMANDS (3 images per folder)
+# ==============================================================================
+
+# Quick test: Zero-shot with Qwen2.5-VL-7B-Instruct
+python $PIPELINE_SCRIPT --strategy zero_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate --quick_test
+
+# Quick test: SA2VA
+python $PIPELINE_SCRIPT --strategy sa2va --model ByteDance/Sa2VA-Qwen3-VL-4B --input_mode rgb_depth_separate --quick_test
+
+# ==============================================================================
+# SPECIFIC IMAGE COMMANDS
+# ==============================================================================
+
+# Run on specific images
+python $PIPELINE_SCRIPT --strategy zero_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate --specific_images 116 124 405
+
+# Run on specific folders
+python $PIPELINE_SCRIPT --strategy zero_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate --folders lms_kamal_LA_downstairs_Nopeople_1 lms_kamal_LA_upstairs_Nopeople_1
+
+# ==============================================================================
+# OUTPUT DIRECTORY STRUCTURE
+# ==============================================================================
+#
+# $OUTPUT_DIR/
+# ├── zero_shot/
+# │   ├── Qwen2.5-VL-7B/
+# │   │   ├── rgb_only_sam3/
+# │   │   └── rgb_depth_separate_sam3/
+# │   ├── Qwen3.5-2B/
+# │   │   ├── rgb_only_sam3/
+# │   │   └── rgb_depth_separate_sam3/
+# │   ├── Qwen3-VL-4B/
+# │   │   ├── rgb_only_sam3/
+# │   │   └── rgb_depth_separate_sam3/
+# │   └── Gemma-4-E4B/
+# │       ├── rgb_only_sam3/
+# │       └── rgb_depth_separate_sam3/
+# ├── few_shot/
+# │   └── (similar structure)
+# ├── two_vlm/
+# │   └── (similar structure)
+# └── sa2va/
+#     └── Sa2VA-Qwen3-VL-4B/
+#         ├── rgb_only_sa2va/
+#         └── rgb_depth_separate_sa2va/
+#
+# ==============================================================================
+# NOTES
+# ==============================================================================
+#
+# 1. Make sure to set the WORK environment variable to your working directory
+# 2. Modify DATA_DIR if your data is in a different location
+# 3. Adjust --few_shot_dir to point to your annotation directory
+# 4. Use --quick_test for quick debugging (3 images per folder)
+# 5. Use --specific_images to run on specific image IDs
+# 6. Use --folders to run on specific folders only
+# 7. Use --clean to remove output directory before running
+# 8. Use --verbose for DEBUG logging
+#
+# ==============================================================================

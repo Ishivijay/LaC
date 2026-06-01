@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Visualize VLM bounding boxes on images from pipeline output JSONs.
+"""Visualize VLM bounding boxes or polygons on images.
 
 Usage:
     python3 visualize_vlm_bboxes.py --run_dir /path/to/two_vlm/Qwen/rgb_only --num_images 5
     python3 visualize_vlm_bboxes.py --run_dir /path/to/two_vlm/Qwen/rgb_only --image_ids 105 110 200
+    python3 visualize_vlm_bboxes.py --image_path /path/to/image.png --annotations_file /path/to/annotations.json
 """
 
 import argparse
@@ -47,25 +48,146 @@ def draw_bbox(image: np.ndarray, bbox: dict, label: str, color: tuple, thickness
 
     cv2.rectangle(image, (x1, y1), (x2, y2), color, thickness)
 
-    # Label background
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.6
-    font_thickness = 1
-    (text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale, font_thickness)
-    cv2.rectangle(image, (x1, y1 - text_h - 10), (x1 + text_w + 6, y1), color, -1)
-    cv2.putText(image, label, (x1 + 3, y1 - 5), font, font_scale, (255, 255, 255), font_thickness)
+    if label:
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.6
+        font_thickness = 1
+        (text_w, text_h), _ = cv2.getTextSize(label, font, font_scale, font_thickness)
+        cv2.rectangle(image, (x1, y1 - text_h - 10), (x1 + text_w + 6, y1), color, -1)
+        cv2.putText(image, label, (x1 + 3, y1 - 5), font, font_scale, (255, 255, 255), font_thickness)
 
     return image
 
 
+def draw_bbox_pixels(image: np.ndarray, bbox: dict, label: str, color: tuple, thickness=2):
+    """Draw a bounding box given pixel coordinates."""
+    x1 = int(bbox["x1"])
+    y1 = int(bbox["y1"])
+    x2 = int(bbox["x2"])
+    y2 = int(bbox["y2"])
+
+    cv2.rectangle(image, (x1, y1), (x2, y2), color, thickness)
+
+    if label:
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.6
+        font_thickness = 1
+        (text_w, text_h), _ = cv2.getTextSize(label, font, font_scale, font_thickness)
+        label_y1 = max(0, y1 - text_h - 10)
+        label_y2 = max(0, y1)
+        cv2.rectangle(image, (x1, label_y1), (x1 + text_w + 6, label_y2), color, -1)
+        cv2.putText(image, label, (x1 + 3, max(0, y1 - 5)), font, font_scale, (255, 255, 255), font_thickness)
+
+    return image
+
+
+def draw_polygon(image: np.ndarray, polygon: list, label: str, color: tuple, thickness=2, fill_alpha=0.2):
+    """Draw a polygon with label on image."""
+    if not polygon:
+        return image
+
+    points = np.array(polygon, dtype=np.int32).reshape((-1, 1, 2))
+    overlay = image.copy()
+    cv2.fillPoly(overlay, [points], color)
+    cv2.addWeighted(overlay, fill_alpha, image, 1 - fill_alpha, 0, image)
+    cv2.polylines(image, [points], isClosed=True, color=color, thickness=thickness)
+
+    if label:
+        x, y = points[:, 0, 0].min(), points[:, 0, 1].min()
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.6
+        font_thickness = 1
+        (text_w, text_h), _ = cv2.getTextSize(label, font, font_scale, font_thickness)
+        label_y1 = max(0, y - text_h - 10)
+        label_y2 = max(0, y)
+        cv2.rectangle(image, (x, label_y1), (x + text_w + 6, label_y2), color, -1)
+        cv2.putText(image, label, (x + 3, max(0, y - 5)), font, font_scale, (255, 255, 255), font_thickness)
+
+    return image
+
+
+def load_annotations(path: Path | None, raw_json: str | None):
+    if path:
+        with open(path) as f:
+            return json.load(f)
+    if raw_json:
+        return json.loads(raw_json)
+    return None
+
+
+def load_bbox(raw_json: str | None):
+    if not raw_json:
+        return None
+    return json.loads(raw_json)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Visualize VLM bounding boxes")
-    parser.add_argument("--run_dir", type=Path, required=True, help="Path to run output dir (e.g., two_vlm/Qwen/rgb_only)")
+    parser.add_argument("--image_path", type=Path, default=None, help="Visualize shapes on a single image")
+    parser.add_argument("--annotations_file", type=Path, default=None, help="JSON file with polygon annotations")
+    parser.add_argument("--annotations_json", type=str, default=None, help="JSON string with polygon annotations")
+    parser.add_argument("--bbox_json", type=str, default=None, help="JSON string with a single bbox object")
+    parser.add_argument("--bbox_pixels", nargs=4, type=float, metavar=("X1", "Y1", "X2", "Y2"), help="Single bbox in pixel coordinates")
+    parser.add_argument("--bbox", nargs=4, type=float, metavar=("X1", "Y1", "X2", "Y2"), help="Single bbox in percent coordinates")
+    parser.add_argument("--label", type=str, default="", help="Label for single bbox mode")
+    parser.add_argument("--output_path", type=Path, default=None, help="Output image path for single-image mode")
+    parser.add_argument("--run_dir", type=Path, default=None, help="Path to run output dir (e.g., two_vlm/Qwen/rgb_only)")
     parser.add_argument("--num_images", type=int, default=5, help="Number of random images to visualize")
     parser.add_argument("--image_ids", nargs="+", help="Specific image IDs to visualize (e.g., 105 110 200)")
     parser.add_argument("--output_dir", type=Path, default=None, help="Output directory (default: run_dir/vlm_bbox_viz)")
     parser.add_argument("--show_scores", action="store_true", help="Show evaluator scores if available")
     args = parser.parse_args()
+
+    if args.image_path:
+        annotations = load_annotations(args.annotations_file, args.annotations_json)
+        bbox_json = load_bbox(args.bbox_json)
+
+        image = np.array(Image.open(args.image_path).convert("RGB"))
+        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+
+        if bbox_json:
+            color = COLORS[0]
+            if all(k in bbox_json for k in ["x1", "y1", "x2", "y2"]):
+                draw_bbox(image, bbox_json, args.label, color)
+            else:
+                print("--bbox_json must contain x1, y1, x2, and y2")
+                return
+        elif args.bbox_pixels or args.bbox:
+            color = COLORS[0]
+            if args.bbox_pixels:
+                bbox = {"x1": args.bbox_pixels[0], "y1": args.bbox_pixels[1], "x2": args.bbox_pixels[2], "y2": args.bbox_pixels[3]}
+                draw_bbox_pixels(image, bbox, args.label, color)
+            else:
+                bbox = {"x1": args.bbox[0], "y1": args.bbox[1], "x2": args.bbox[2], "y2": args.bbox[3]}
+                draw_bbox(image, bbox, args.label, color)
+        elif not annotations:
+            print("Provide --annotations_file, --annotations_json, --bbox_pixels, or --bbox in single-image mode")
+            return
+        else:
+            for i, annotation in enumerate(annotations):
+                label = annotation.get("label", f"shape_{i}")
+                color = COLORS[i % len(COLORS)]
+
+                polygon = annotation.get("polygon")
+                if polygon:
+                    draw_polygon(image, polygon, label, color)
+                    continue
+
+                bbox = annotation.get("bbox_pixels") or annotation.get("bbox")
+                if bbox and all(k in bbox for k in ["x1", "y1", "x2", "y2"]):
+                    if annotation.get("bbox_pixels"):
+                        draw_bbox_pixels(image, bbox, label, color)
+                    else:
+                        draw_bbox(image, bbox, label, color)
+
+        output_path = args.output_path or args.image_path.with_name(f"{args.image_path.stem}_viz.png")
+        cv2.imwrite(str(output_path), image)
+        print(f"Saved: {output_path}")
+        return
+
+    if not args.run_dir:
+        print("Provide --run_dir for bbox mode or --image_path for polygon mode")
+        return
 
     run_dir = args.run_dir
     output_dir = args.output_dir or run_dir / "vlm_bbox_viz"

@@ -1,1 +1,0 @@
-Evaluate the anxiety level using the provided hazard_reasoning and hazardous_objects, and output the result in the specified JSON format. 

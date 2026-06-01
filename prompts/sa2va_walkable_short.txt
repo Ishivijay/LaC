@@ -1,0 +1,6 @@
+<image>Segment all walkable areas safe for traversal in this indoor scene.
+
+INCLUDE: floors, staircases, ramps, walkways, corridors, and any other surfaces safe for walking.
+EXCLUDE: walls, furniture, obstacles, drop-offs, and unsafe surfaces.
+
+Return segmentation masks for all walkable areas.
