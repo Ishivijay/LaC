@@ -86,9 +86,13 @@ SHORT_MODEL_NAMES = {
     "gemma-4-E4B-it": "Gemma-4-E4B",
     "ByteDance/Sa2VA-Qwen3-VL-4B": "Sa2VA-Qwen3-VL-4B",
     "Sa2VA-Qwen3-VL-4B": "Sa2VA-Qwen3-VL-4B",
+    "TIPSv2-B": "TIPSv2-B",
+    "TIPSv2-L": "TIPSv2-L",
+    "TIPSv2-So": "TIPSv2-So",
+    "TIPSv2-g": "TIPSv2-g",
 }
 
-STRATEGIES = ["zero_shot", "few_shot", "two_vlm", "sa2va"]
+STRATEGIES = ["zero_shot", "few_shot", "two_vlm", "sa2va", "tipsv2"]
 INPUT_MODES = ["rgb_only", "rgb_depth_separate"]
 
 
@@ -105,7 +109,8 @@ def _model_tag(strategy: str, reasoner_name: str, evaluator_name: str = None) ->
 # Prompt Loading
 # ---------------------------------------------------------------------------
 
-DEFAULT_PROMPT_DIR = Path(__file__).parent / "prompts_navigable"
+DEFAULT_PROMPT_DIR = Path(__file__).parent / "prompts"
+NAVIGABLE_PROMPT_DIR = Path(__file__).parent / "prompts_navigable"
 _active_prompt_dir = DEFAULT_PROMPT_DIR
 
 
@@ -114,8 +119,19 @@ def set_prompt_dir(prompt_dir: Path):
     _active_prompt_dir = prompt_dir
 
 
-def load_prompt(filename: str) -> str:
-    path = _active_prompt_dir / filename
+def get_prompt_dir_for_strategy(strategy: str) -> Path:
+    """Get the appropriate prompt directory based on strategy."""
+    if strategy == "sa2va":
+        return DEFAULT_PROMPT_DIR  # Use new walkable prompts for SA2VA
+    else:
+        return NAVIGABLE_PROMPT_DIR  # Use old navigable prompts for VLM strategies
+
+
+def load_prompt(filename: str, prompt_dir: Optional[Path] = None) -> str:
+    """Load a prompt from the specified directory or active prompt directory."""
+    if prompt_dir is None:
+        prompt_dir = _active_prompt_dir
+    path = prompt_dir / filename
     if not path.exists():
         # Fallback to default prompts
         path = DEFAULT_PROMPT_DIR / filename
@@ -133,19 +149,23 @@ def run_free_ground_reasoner(
     model, processor, config: Dict, rgb_image: Image.Image,
     depth_image: Optional[Image.Image], model_config: Dict = None,
 ) -> Dict:
-    """Run the reasoner VLM to identify walkable areas safe for traversal."""
+    """Run the reasoner VLM to identify free ground areas (VLM strategies only)."""
     input_mode = config["pipeline"].get("input_mode", "rgb_depth_separate")
-    system_prompt = load_prompt("free_ground_reasoner_system_walkable_short.txt")
+    strategy = config["pipeline"].get("strategy", "zero_shot")
+    
+    # Use navigable prompts for VLM strategies (old prompts that exclude stairs/ramps)
+    prompt_dir = get_prompt_dir_for_strategy(strategy)
+    system_prompt = load_prompt("free_ground_reasoner_system.txt", prompt_dir=prompt_dir)
 
     if input_mode == "rgb_depth_separate" and depth_image is not None:
-        user_prompt = load_prompt("free_ground_reasoner_user_depth_walkable_short.txt")
+        user_prompt = load_prompt("free_ground_reasoner_user_depth.txt", prompt_dir=prompt_dir)
         user_content = [
             {"type": "text", "text": user_prompt},
             {"type": "image", "image": rgb_image},
             {"type": "image", "image": depth_image},
         ]
     else:
-        user_prompt = load_prompt("free_ground_reasoner_user_walkable_short.txt")
+        user_prompt = load_prompt("free_ground_reasoner_user.txt", prompt_dir=prompt_dir)
         user_content = [
             {"type": "text", "text": user_prompt},
             {"type": "image", "image": rgb_image},
@@ -591,6 +611,232 @@ def _draw_sa2va_bbox_panel(rgb_array: np.ndarray, areas: List[Dict]) -> np.ndarr
 
 
 # ---------------------------------------------------------------------------
+# TIPSv2 Strategy Functions (zero-shot segmentation via text-patch similarity)
+# ---------------------------------------------------------------------------
+
+def load_tipsv2_model(config: Dict, device: str):
+    """Load TIPSv2 segmenter from config.
+
+    Returns a TIPSv2Segmenter instance (encapsulates both vision + text encoders).
+    """
+    from tipsv2_segmenter import TIPSv2Segmenter
+
+    tipsv2_config = config["model"].get("tipsv2", {})
+    variant = tipsv2_config.get("variant", "L")
+    checkpoint_dir = tipsv2_config.get("checkpoint_dir", None)
+    image_size = tipsv2_config.get("image_size", 448)
+    inference_mode = tipsv2_config.get("inference_mode", "slide")
+    stride = tipsv2_config.get("stride", 336)
+    tips_repo_path = tipsv2_config.get("tips_repo_path", None)
+
+    # Custom class definitions (optional)
+    walkable_classes = tipsv2_config.get("walkable_classes", None)
+
+    segmenter = TIPSv2Segmenter(
+        variant=variant,
+        checkpoint_dir=checkpoint_dir,
+        device=device,
+        image_size=image_size,
+        inference_mode=inference_mode,
+        stride=stride,
+        walkable_classes=walkable_classes,
+        tips_repo_path=tips_repo_path,
+    )
+    return segmenter
+
+
+def process_tipsv2_image(
+    rgb_path: Path,
+    depth_path: Optional[Path],
+    image_id: str,
+    folder_name: str,
+    segmenter,
+    config: Dict,
+    output_dir: Path,
+) -> Dict:
+    """Process a single image with TIPSv2 zero-shot segmentation.
+
+    This mirrors process_sa2va_image() but uses TIPSv2 for segmentation.
+    TIPSv2 is RGB-only; depth images are used only for visualization.
+    """
+    from datetime import datetime
+
+    input_mode = config["pipeline"].get("input_mode", "rgb_only")
+
+    # Load images
+    rgb_image = load_image_for_vlm(rgb_path)
+    depth_image = None
+    if input_mode != "rgb_only" and depth_path:
+        depth_image = load_image_for_vlm(depth_path)
+
+    # Run TIPSv2 segmentation
+    result = segmenter.segment_with_components(rgb_image)
+    walkable_mask = result["walkable_mask"]
+    components = result["components"]
+
+    # Prepare output directory
+    folder_dir = output_dir / folder_name
+    mask_dir = folder_dir / "masks"
+    mask_dir.mkdir(parents=True, exist_ok=True)
+
+    rgb_arr = np.array(rgb_image.convert("RGB"))
+    h, w = rgb_arr.shape[:2]
+    overlay = rgb_arr.copy()
+    colors = [
+        (0, 255, 0),
+        (0, 128, 255),
+        (255, 0, 255),
+        (255, 255, 0),
+        (0, 255, 255),
+        (255, 128, 0),
+    ]
+
+    areas: List[Dict] = []
+    saved_masks: List[np.ndarray] = []
+
+    for idx, comp in enumerate(components):
+        comp_mask = comp["mask"]
+        # Resize mask to original image size if needed
+        if comp_mask.shape != (h, w):
+            comp_mask_img = Image.fromarray((comp_mask.astype(np.uint8) * 255))
+            comp_mask_img = comp_mask_img.resize((w, h), Image.NEAREST)
+            comp_mask = np.array(comp_mask_img) > 127
+
+        bbox_px = comp.get("bbox", _mask_bbox(comp_mask))
+        if bbox_px is None:
+            continue
+
+        name = f"walkable_area_{idx}"
+        safe_name = re.sub(r"[^\w]", "_", name)[:30]
+        base = f"{image_id}_mask_{len(saved_masks)}_{safe_name}"
+
+        # Save mask
+        mask_img = Image.fromarray((comp_mask.astype(np.uint8) * 255))
+        mask_img.save(mask_dir / f"{base}.png")
+        np.save(mask_dir / f"{base}.npy", comp_mask)
+
+        # Create overlay
+        color = colors[len(saved_masks) % len(colors)]
+        color_mask = np.zeros((h, w, 3), dtype=np.uint8)
+        color_mask[comp_mask] = color
+        overlay[comp_mask] = (overlay[comp_mask] * 0.5 + color_mask[comp_mask] * 0.5).astype(np.uint8)
+
+        areas.append({
+            "name": name,
+            "type": "tipsv2_walkable",
+            "bbox": _bbox_percent(bbox_px, (w, h)),
+            "bbox_pixels": bbox_px,
+            "area_pixels": int(comp_mask.sum()),
+        })
+        saved_masks.append(comp_mask)
+
+    # Save full walkable mask
+    full_mask_img = Image.fromarray((walkable_mask.astype(np.uint8) * 255))
+    full_mask_img.save(mask_dir / f"{image_id}_walkable_mask.png")
+    np.save(mask_dir / f"{image_id}_walkable_mask.npy", walkable_mask)
+
+    # Save segmentation overlay
+    Image.fromarray(overlay).save(mask_dir / f"{image_id}_segmentation_overlay.png")
+
+    # Build consolidated image
+    consolidated = _build_tipsv2_consolidated_image(rgb_image, depth_image, areas, overlay, input_mode)
+    consolidated.save(folder_dir / f"{image_id}_consolidated.png")
+
+    # Save probability map if available
+    if "prob_map" in result:
+        prob_map = result["prob_map"]
+        # Save walkable probability as heatmap
+        walkable_idx = result["class_names"].index("walkable")
+        walkable_prob = prob_map[walkable_idx]
+        # Normalize to 0-255 for visualization
+        prob_vis = (walkable_prob * 255).astype(np.uint8)
+        Image.fromarray(prob_vis).save(mask_dir / f"{image_id}_walkable_prob.png")
+        np.save(mask_dir / f"{image_id}_prob_map.npy", prob_map)
+
+    # Prepare result
+    tipsv2_config = config["model"].get("tipsv2", {})
+    variant = tipsv2_config.get("variant", "L")
+    model_tag = f"TIPSv2-{variant}"
+
+    result_dict = {
+        "folder": folder_name,
+        "image_id": image_id,
+        "strategy": "tipsv2",
+        "model_tag": model_tag,
+        "model_id": f"TIPSv2-{variant}",
+        "input_mode": input_mode,
+        "segmentation_method": "tipsv2_zero_shot",
+        "timestamp": datetime.now().isoformat(),
+        "variant": variant,
+        "inference_mode": tipsv2_config.get("inference_mode", "slide"),
+        "num_components": len(saved_masks),
+        "walkable_pixels": int(walkable_mask.sum()),
+        "total_pixels": h * w,
+        "walkable_ratio": round(float(walkable_mask.sum()) / (h * w), 4),
+        "walkable_areas": areas,
+    }
+
+    # Save JSON result
+    with open(folder_dir / f"{image_id}_lac_analysis.json", "w") as f:
+        json.dump(result_dict, f, indent=2, default=str)
+
+    # Save all masks together
+    if saved_masks:
+        np.save(folder_dir / f"{image_id}_tipsv2_masks.npy", np.stack(saved_masks, axis=0))
+
+    return result_dict
+
+
+def _build_tipsv2_consolidated_image(
+    rgb_image: Image.Image,
+    depth_image: Optional[Image.Image],
+    areas: List[Dict],
+    overlay: np.ndarray,
+    input_mode: str,
+) -> Image.Image:
+    """Build consolidated visualization image for TIPSv2 results."""
+    from PIL import ImageDraw, ImageFont
+
+    rgb_arr = np.array(rgb_image.convert("RGB"))
+    h, w = rgb_arr.shape[:2]
+    label_h = 30
+    gap = 4
+
+    panels: List[Tuple[str, np.ndarray]] = [("Original RGB", rgb_arr)]
+
+    if input_mode != "rgb_only" and depth_image is not None:
+        depth_rgb = np.array(depth_image.convert("RGB"))
+        if depth_rgb.shape[:2] != (h, w):
+            depth_rgb = np.array(depth_image.convert("RGB").resize((w, h), Image.NEAREST))
+        panels.append(("Depth Map", depth_rgb))
+
+    if areas:
+        panels.append(("TIPSv2 BBox", _draw_sa2va_bbox_panel(rgb_arr, areas)))
+
+    panels.append(("Walkable Segmentation", overlay))
+
+    total_w = sum(panel.shape[1] for _, panel in panels) + gap * (len(panels) - 1)
+    total_h = h + label_h
+    canvas = np.full((total_h, total_w, 3), 255, dtype=np.uint8)
+
+    x_offset = 0
+    for label, panel in panels:
+        canvas[0:label_h, x_offset:x_offset + panel.shape[1]] = (40, 40, 40)
+        label_img = Image.fromarray(canvas)
+        draw = ImageDraw.Draw(label_img)
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
+        except (OSError, IOError):
+            font = ImageFont.load_default()
+        draw.text((x_offset + 8, 7), label, fill=(255, 255, 255), font=font)
+        canvas = np.array(label_img)
+        canvas[label_h:, x_offset:x_offset + panel.shape[1]] = panel
+        x_offset += panel.shape[1] + gap
+
+    return Image.fromarray(canvas)
+
+
+# ---------------------------------------------------------------------------
 # Stage 2: Traversability Evaluator (used by two_vlm only)
 # ---------------------------------------------------------------------------
 
@@ -601,9 +847,14 @@ def run_traversability_evaluator(
 ) -> Dict:
     """Run the evaluator VLM to score traversability of each area."""
     input_mode = config["pipeline"].get("input_mode", "rgb_depth_separate")
-    system_template = load_prompt("traversability_evaluator_system.txt")
+    strategy = config["pipeline"].get("strategy", "zero_shot")
+    
+    # Use navigable prompts for VLM strategies (old prompts that exclude stairs/ramps)
+    prompt_dir = get_prompt_dir_for_strategy(strategy)
+    system_template = load_prompt("traversability_evaluator_system.txt", prompt_dir=prompt_dir)
 
-    free_ground_areas = reasoner_output.get("free_ground_areas", [])
+    # Support both new 'walkable_areas' and old 'free_ground_areas' keys
+    free_ground_areas = reasoner_output.get("walkable_areas", reasoner_output.get("free_ground_areas", []))
     navigability_reasoning = reasoner_output.get("navigability_reasoning", "None")
 
     system_prompt = system_template.replace(
@@ -614,14 +865,14 @@ def run_traversability_evaluator(
     )
 
     if input_mode == "rgb_depth_separate" and depth_image is not None:
-        user_prompt = load_prompt("traversability_evaluator_user_depth.txt")
+        user_prompt = load_prompt("traversability_evaluator_user_depth.txt", prompt_dir=prompt_dir)
         user_content = [
             {"type": "text", "text": user_prompt},
             {"type": "image", "image": rgb_image},
             {"type": "image", "image": depth_image},
         ]
     else:
-        user_prompt = load_prompt("traversability_evaluator_user.txt")
+        user_prompt = load_prompt("traversability_evaluator_user.txt", prompt_dir=prompt_dir)
         user_content = [
             {"type": "text", "text": user_prompt},
             {"type": "image", "image": rgb_image},
@@ -820,9 +1071,13 @@ def build_few_shot_messages(
     The model is instructed to output JSON with free_ground_areas.
     """
     input_mode = config["pipeline"].get("input_mode", "rgb_depth_separate")
+    strategy = config["pipeline"].get("strategy", "zero_shot")
+    
+    # Use navigable prompts for VLM strategies (old prompts that exclude stairs/ramps)
+    prompt_dir = get_prompt_dir_for_strategy(strategy)
 
     # System prompt (reasoner prompt + example instruction)
-    system_prompt = load_prompt("free_ground_reasoner_system.txt")
+    system_prompt = load_prompt("free_ground_reasoner_system.txt", prompt_dir=prompt_dir)
     system_prompt += (
         "\n\nYou will see EXAMPLE images with their correct analysis, "
         "then a NEW image to analyze. "
@@ -857,14 +1112,14 @@ def build_few_shot_messages(
 
     # Query message
     if input_mode == "rgb_depth_separate" and depth_image is not None:
-        user_prompt = load_prompt("free_ground_reasoner_user_depth.txt")
+        user_prompt = load_prompt("free_ground_reasoner_user_depth.txt", prompt_dir=prompt_dir)
         user_content = [
             {"type": "text", "text": "Now analyze this NEW scene and identify all free navigable areas."},
             {"type": "image", "image": rgb_image},
             {"type": "image", "image": depth_image},
         ]
     else:
-        user_prompt = load_prompt("free_ground_reasoner_user.txt")
+        user_prompt = load_prompt("free_ground_reasoner_user.txt", prompt_dir=prompt_dir)
         user_content = [
             {"type": "text", "text": "Now analyze this NEW scene and identify all free navigable areas."},
             {"type": "image", "image": rgb_image},
@@ -1317,7 +1572,7 @@ def process_single_image(
             config, rgb_image, depth_image,
         )
         t1 = time.time()
-        areas = reasoner_output.get("free_ground_areas", [])
+        areas = reasoner_output.get("walkable_areas", [])
         logger.info(f"    Found {len(areas)} areas ({t1-t0:.1f}s)")
         result["reasoner"] = {
             "output": reasoner_output,
@@ -1338,7 +1593,7 @@ def process_single_image(
         )
         reasoner_output = parse_reasoner_output(response)
         t1 = time.time()
-        areas = reasoner_output.get("free_ground_areas", [])
+        areas = reasoner_output.get("walkable_areas", [])
         logger.info(f"    Found {len(areas)} areas ({t1-t0:.1f}s)")
         result["reasoner"] = {
             "output": reasoner_output,
@@ -1356,7 +1611,7 @@ def process_single_image(
             config, rgb_image, depth_image,
         )
         t1 = time.time()
-        areas = reasoner_output.get("free_ground_areas", [])
+        areas = reasoner_output.get("walkable_areas", [])
         logger.info(f"    Found {len(areas)} areas ({t1-t0:.1f}s)")
         result["reasoner"] = {
             "output": reasoner_output,
@@ -1462,6 +1717,12 @@ def process_single_image(
             vlm_areas=result.get("vlm_areas"),
         )
 
+    # Strip raw VLM response from saved JSON (redundant with parsed output)
+    if "reasoner" in result and "output" in result["reasoner"]:
+        result["reasoner"]["output"].pop("raw_response", None)
+    if "evaluator" in result and "output" in result["evaluator"]:
+        result["evaluator"]["output"].pop("raw_response", None)
+
     if config["output"].get("save_individual_json", True):
         json_dir = output_dir / folder_name
         json_dir.mkdir(parents=True, exist_ok=True)
@@ -1486,6 +1747,11 @@ def run_pipeline(config: Dict):
         sa2va_name = config["model"]["sa2va"]["name"]
         mtag = SHORT_MODEL_NAMES.get(sa2va_name, sa2va_name)
         method = "sa2va"
+    elif strategy == "tipsv2":
+        tipsv2_config = config["model"].get("tipsv2", {})
+        variant = tipsv2_config.get("variant", "L")
+        mtag = f"TIPSv2-{variant}"
+        method = "tipsv2"
     else:
         r_name = config["model"]["reasoner"]["name"]
         e_name = config["model"].get("evaluator", {}).get("name", r_name)
@@ -1550,6 +1816,14 @@ def run_pipeline(config: Dict):
         logger.info(f"Loading SA2VA model: {sa2va_config['hf_model_id']}")
         sa2va_model, sa2va_proc = load_sa2va_model(sa2va_config["hf_model_id"], device)
         models["sa2va"] = (sa2va_model, sa2va_proc)
+        config["pipeline"]["device"] = device
+    elif strategy == "tipsv2":
+        # Load TIPSv2 segmenter
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info(f"Loading TIPSv2 segmenter...")
+        segmenter = load_tipsv2_model(config, device)
+        models["tipsv2"] = segmenter
         config["pipeline"]["device"] = device
     else:
         # VLM strategies
@@ -1629,6 +1903,13 @@ def run_pipeline(config: Dict):
                         rgb_path, depth_path, str(image_id), folder.name,
                         sa2va_model, sa2va_proc, config, output_dir,
                     )
+                elif strategy == "tipsv2":
+                    # Use TIPSv2 processing
+                    segmenter = models["tipsv2"]
+                    result = process_tipsv2_image(
+                        rgb_path, depth_path, str(image_id), folder.name,
+                        segmenter, config, output_dir,
+                    )
                 else:
                     # Use VLM processing
                     result = process_single_image(
@@ -1694,18 +1975,22 @@ Examples:
 
   # SA2VA (direct segmentation)
   python lac_pipeline.py --strategy sa2va --model ByteDance/Sa2VA-Qwen3-VL-4B --input_mode rgb_depth_separate
+
+  # TIPSv2 (zero-shot segmentation via text-patch similarity)
+  python walkable_area_pipeline.py --strategy tipsv2 --model L --input_mode rgb_only --config tipsv2_config.yaml
         """,
     )
     # Strategy
     parser.add_argument("--strategy", type=str, default="two_vlm",
                         choices=STRATEGIES,
-                        help="Pipeline strategy: zero_shot, few_shot, two_vlm, sa2va (default: two_vlm)")
-    parser.add_argument("--config", type=str, default="lac_config.yaml",
+                        help="Pipeline strategy: zero_shot, few_shot, two_vlm, sa2va, tipsv2 (default: two_vlm)")
+    parser.add_argument("--config", type=str, default="walkable_area_config.yaml",
                         help="Path to YAML config file")
 
     # Model selection (VLM strategies)
     parser.add_argument("--model", type=str, default=None,
-                        help="Model for all VLM stages (name or HF ID), or SA2VA model for sa2va strategy")
+                        help="Model for all VLM stages (name or HF ID), SA2VA model for sa2va, "
+                             "or TIPSv2 variant (B/L/So/g) for tipsv2 strategy")
     parser.add_argument("--reasoner_model", type=str, default=None,
                         help="Reasoner model (overrides --model for reasoner, VLM strategies only)")
     parser.add_argument("--evaluator_model", type=str, default=None,
@@ -1864,6 +2149,30 @@ def merge_args(config: Dict, args: argparse.Namespace) -> Dict:
                 "hf_model_id": "ByteDance/Sa2VA-Qwen3-VL-4B",
             }
 
+    # Handle TIPSv2 model configuration
+    if strategy == "tipsv2":
+        if "tipsv2" not in config["model"]:
+            config["model"]["tipsv2"] = {}
+        tipsv2_config = config["model"]["tipsv2"]
+        # Allow --model to set variant (e.g., --model L or --model TIPSv2-L)
+        if getattr(args, "model", None):
+            model_arg = args.model
+            # Strip common prefixes
+            for prefix in ["TIPSv2-", "tipsv2-", "TIPSv2", "tipsv2"]:
+                if model_arg.startswith(prefix):
+                    model_arg = model_arg[len(prefix):]
+                    break
+            if model_arg in ["B", "L", "So", "g"]:
+                tipsv2_config["variant"] = model_arg
+            else:
+                logger.warning(f"Unknown TIPSv2 variant '{model_arg}', using 'L'")
+                tipsv2_config["variant"] = "L"
+        # Set defaults
+        tipsv2_config.setdefault("variant", "L")
+        tipsv2_config.setdefault("inference_mode", "slide")
+        tipsv2_config.setdefault("image_size", 448)
+        tipsv2_config.setdefault("stride", 336)
+
     return config
 
 
@@ -1901,9 +2210,15 @@ def main():
     # Print config summary
     strategy = config["pipeline"]["strategy"]
     input_mode = config["pipeline"].get("input_mode", "rgb_depth_separate")
-    r_name = config["model"]["reasoner"]["name"]
-    e_name = config["model"].get("evaluator", {}).get("name", r_name)
-    mtag = _model_tag(strategy, r_name, e_name if strategy == "two_vlm" else None)
+    if strategy == "sa2va":
+        mtag = SHORT_MODEL_NAMES.get(config["model"]["sa2va"]["name"], config["model"]["sa2va"]["name"])
+    elif strategy == "tipsv2":
+        tipsv2_cfg = config["model"].get("tipsv2", {})
+        mtag = f"TIPSv2-{tipsv2_cfg.get('variant', 'L')}"
+    else:
+        r_name = config["model"]["reasoner"]["name"]
+        e_name = config["model"].get("evaluator", {}).get("name", r_name)
+        mtag = _model_tag(strategy, r_name, e_name if strategy == "two_vlm" else None)
     global _LOG_MODEL_NAME
     _LOG_MODEL_NAME = mtag
     logger.info("=" * 60)
@@ -1916,6 +2231,14 @@ def main():
         sa2va_model_id = config["model"].get("sa2va", {}).get("hf_model_id", "unknown")
         logger.info(f"SA2VA Model:  {sa2va_model_id}")
         logger.info(f"Max side:     {config['pipeline'].get('image_max_side', 896)}")
+        logger.info(f"Prompts:      Walkable (include stairs/ramps)")
+    elif strategy == "tipsv2":
+        tipsv2_config = config["model"].get("tipsv2", {})
+        variant = tipsv2_config.get("variant", "L")
+        logger.info(f"TIPSv2 Variant: {variant}")
+        logger.info(f"Inference:    {tipsv2_config.get('inference_mode', 'slide')}")
+        logger.info(f"Image size:   {tipsv2_config.get('image_size', 448)}")
+        logger.info(f"Method:       Zero-shot text-patch similarity")
     else:
         logger.info(f"Reasoner:     {config['model']['reasoner']['name']}")
         if strategy == "two_vlm":
@@ -1927,6 +2250,7 @@ def main():
             logger.info(f"Num examples: {config['pipeline'].get('num_examples', 3)}")
         logger.info(f"Segmentation: SAM3 ({config['model']['segmentation'].get('sam3_model_id', 'facebook/sam3')})")
         logger.info(f"SAM3 mode:    {config['model']['segmentation'].get('sam3_input_mode', 'text_only')}")
+        logger.info(f"Prompts:      Navigable (exclude stairs/ramps)")
 
     run_pipeline(config)
 

@@ -1,0 +1,63 @@
+# TIPSv2 Zero-Shot Segmentation — Walkable Area Detection Config
+# ================================================================
+# Uses TIPSv2 (Google DeepMind) for zero-shot walkable area segmentation
+# via text-patch cosine similarity.
+#
+# Strategy: tipsv2 (no VLM, no SAM3 — direct zero-shot segmentation)
+# Input:    RGB only (TIPSv2 does not use depth natively)
+
+# Data paths
+data:
+  base_dir: "/home/woody/iwnt/iwnt164h/Paper_test_data"
+  rgb_subfolder: "sharpen_rgb/PNG"
+  depth_subfolder: "marigold_zero_shot/depth_colored"
+
+# Model configuration
+model:
+  # TIPSv2 model (used with --strategy tipsv2)
+  tipsv2:
+    variant: "L"                    # B, L, So, g (L recommended for balance of speed/quality)
+    checkpoint_dir: null            # Auto-resolved to $WORK/tipsv2_checkpoints
+    image_size: 448                 # Input resolution (448 for high-res models)
+    inference_mode: "slide"         # "whole" (fast) or "slide" (higher quality)
+    stride: 336                     # Sliding window stride (only for "slide" mode)
+    tips_repo_path: null            # Auto-detected from ~/tips_repo
+    # Custom walkable/non-walkable class definitions (null = use defaults)
+    walkable_classes: null
+
+  # VLM models (not used by tipsv2 strategy, but required by config schema)
+  reasoner:
+    name: "Qwen2.5-VL-7B-Instruct"
+    hf_model_id: "Qwen/Qwen2.5-VL-7B-Instruct"
+    quantization: "4bit"
+    dtype: "auto"
+    max_new_tokens: 1024
+    temperature: 0.1
+
+  evaluator:
+    name: "Qwen2.5-VL-7B-Instruct"
+    hf_model_id: "Qwen/Qwen2.5-VL-7B-Instruct"
+    quantization: "4bit"
+    dtype: "auto"
+    max_new_tokens: 512
+    temperature: 0.1
+
+  # SAM3 segmentation (not used by tipsv2 strategy)
+  segmentation:
+    method: "sam3"
+    sam3_model_id: "facebook/sam3"
+    sam3_mask_threshold: 0.5
+    sam3_input_mode: "text_only"
+    device: "cuda"
+
+# Pipeline settings
+pipeline:
+  strategy: "tipsv2"                  # zero_shot | few_shot | two_vlm | sa2va | tipsv2
+  input_mode: "rgb_only"             # TIPSv2 is RGB-only (depth not used for segmentation)
+  depth_flatness_threshold: 80
+
+# Output settings
+output:
+  dir: "/home/woody/iwnt/iwnt164h/Paper_test_data_experiments"
+  save_individual_json: true
+  save_visualizations: true

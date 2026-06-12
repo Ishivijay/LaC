@@ -1,127 +1,332 @@
-# Unified Walkable Area Detection - All Experiments
-# ===================================================
-# This file contains all commands to run experiments with different strategies,
+# Unified Walkable Area Detection - All Experiments (Slurm Commands)
+# ==============================================================================
+# This file contains all slurm commands to run experiments with different strategies,
 # models, and input modes for identifying walkable areas in indoor scenes.
+#
+# IMPORTANT: All commands use --gt_dir to restrict processing to only the 1612 images
+# that have proper ground truth annotations in /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations
 
 # Environment Variables (modify as needed)
-export WORK="${WORK:-/home/woody/iwnt/iwnt164h}"
-export DATA_DIR="${DATA_DIR:-/home/woody/iwnt/iwnt164h/mlp_dataset/prospthesisproject-Data/Code/Data}"
-export OUTPUT_DIR="$WORK/free_ground_results"
+# export WORK="${WORK:-/home/woody/iwnt/iwnt164h}"
+# export DATA_DIR="${DATA_DIR:-/home/woody/iwnt/iwnt164h/mlp_dataset/prospthesisproject-Data/Code/Data}"
+# export OUTPUT_DIR="$WORK/free_ground_results"
+# export GT_DIR="/home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
 
 # Pipeline script
-PIPELINE_SCRIPT="walkable_area_pipeline.py"
+# PIPELINE_SCRIPT="walkable_area_pipeline.py"
 
 # ==============================================================================
 # ZERO-SHOT EXPERIMENTS
 # ==============================================================================
 
-# Zero-shot with Qwen2.5-VL-7B-Instruct (RGB only)
-python $PIPELINE_SCRIPT --strategy zero_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_only
+# Zero-shot with Qwen2.5-VL-7B-Instruct (RGB only) - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=20:00:00 \
+    --job-name=zs_qwen25_7b_rgb \
+    --output="$WORK/free_ground_results/slurm_logs/zs_qwen25_7b_rgb_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy zero_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations --clean"
 
-# Zero-shot with Qwen2.5-VL-7B-Instruct (RGB + Depth)
-python $PIPELINE_SCRIPT --strategy zero_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate
+# Zero-shot with Qwen2.5-VL-7B-Instruct (RGB + Depth) - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=20:00:00 \
+    --job-name=zs_qwen25_7b_rgbd \
+    --output="$WORK/free_ground_results/slurm_logs/zs_qwen25_7b_rgbd_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy zero_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations --clean" 
 
-# Zero-shot with Qwen3.5-2B (RGB only)
-python $PIPELINE_SCRIPT --strategy zero_shot --model Qwen3.5-2B --input_mode rgb_only
+# Zero-shot with Qwen3.5-2B (RGB only) - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=06:00:00 \
+    --job-name=zs_qwen35_2b_rgb \
+    --output="$WORK/free_ground_results/slurm_logs/zs_qwen35_2b_rgb_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy zero_shot --model Qwen3.5-2B --input_mode rgb_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
 
-# Zero-shot with Qwen3.5-2B (RGB + Depth)
-python $PIPELINE_SCRIPT --strategy zero_shot --model Qwen3.5-2B --input_mode rgb_depth_separate
+# Zero-shot with Qwen3.5-2B (RGB + Depth) - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=06:00:00 \
+    --job-name=zs_qwen35_2b_rgbd \
+    --output="$WORK/free_ground_results/slurm_logs/zs_qwen35_2b_rgbd_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy zero_shot --model Qwen3.5-2B --input_mode rgb_depth_separate --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
 
-# Zero-shot with Qwen3-VL-4B-Instruct (RGB only)
-python $PIPELINE_SCRIPT --strategy zero_shot --model Qwen3-VL-4B-Instruct --input_mode rgb_only
+# Zero-shot with Qwen/Qwen3-VL-4B-Instruct (RGB only) - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=20:00:00 \
+    --job-name=zs_qwen3_4b_rgb \
+    --output="$WORK/free_ground_results/slurm_logs/zs_qwen3_4b_rgb_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy zero_shot --model Qwen/Qwen3-VL-4B-Instruct --input_mode rgb_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations --clean"
 
-# Zero-shot with Qwen3-VL-4B-Instruct (RGB + Depth)
-python $PIPELINE_SCRIPT --strategy zero_shot --model Qwen3-VL-4B-Instruct --input_mode rgb_depth_separate
+# Zero-shot with Qwen/Qwen3-VL-4B-Instruct (RGB + Depth) - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=20:00:00 \
+    --job-name=zs_qwen3_4b_rgbd \
+    --output="$WORK/free_ground_results/slurm_logs/zs_qwen3_4b_rgbd_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy zero_shot --model Qwen/Qwen3-VL-4B-Instruct --input_mode rgb_depth_separate --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations --clean"
 
-# Zero-shot with gemma-4-E4B-it (RGB only)
-python $PIPELINE_SCRIPT --strategy zero_shot --model gemma-4-E4B-it --input_mode rgb_only
+# Zero-shot with gemma-4-E4B-it (RGB only) - V100
+sbatch --partition=v100 --gres=gpu:v100:1 --time=20:00:00 \
+    --job-name=zs_gemma_4e4b_rgb \
+    --output="$WORK/free_ground_results/slurm_logs/zs_gemma_4e4b_rgb_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy zero_shot --model gemma-4-E4B-it --input_mode rgb_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations --clean"
 
-# Zero-shot with gemma-4-E4B-it (RGB + Depth)
-python $PIPELINE_SCRIPT --strategy zero_shot --model gemma-4-E4B-it --input_mode rgb_depth_separate
+# Zero-shot with gemma-4-E4B-it (RGB + Depth) - V100
+sbatch --partition=v100 --gres=gpu:v100:1 --time=20:00:00 \
+    --job-name=zs_gemma_4e4b_rgbd \
+    --output="$WORK/free_ground_results/slurm_logs/zs_gemma_4e4b_rgbd_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy zero_shot --model gemma-4-E4B-it --input_mode rgb_depth_separate --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations --clean"
 
 # ==============================================================================
 # FEW-SHOT EXPERIMENTS
 # ==============================================================================
 
-# Few-shot with Qwen2.5-VL-7B-Instruct (RGB + Depth, 3 examples)
-python $PIPELINE_SCRIPT --strategy few_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate --few_shot_dir $DATA_DIR/annotations --num_examples 3
+# Few-shot with Qwen2.5-VL-7B-Instruct (RGB + Depth, 3 examples) - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=06:00:00 \
+    --job-name=fs_qwen25_7b_rgbd \
+    --output="$WORK/free_ground_results/slurm_logs/fs_qwen25_7b_rgbd_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy few_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate --few_shot_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations --num_examples 3 --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
 
-# Few-shot with Qwen3.5-2B (RGB + Depth, 3 examples)
-python $PIPELINE_SCRIPT --strategy few_shot --model Qwen3.5-2B --input_mode rgb_depth_separate --few_shot_dir $DATA_DIR/annotations --num_examples 3
+# Few-shot with Qwen3.5-2B (RGB + Depth, 3 examples) - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=06:00:00 \
+    --job-name=fs_qwen35_2b_rgbd \
+    --output="$WORK/free_ground_results/slurm_logs/fs_qwen35_2b_rgbd_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy few_shot --model Qwen3.5-2B --input_mode rgb_depth_separate --few_shot_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations --num_examples 3 --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
 
-# Few-shot with Qwen3-VL-4B-Instruct (RGB + Depth, 3 examples)
-python $PIPELINE_SCRIPT --strategy few_shot --model Qwen3-VL-4B-Instruct --input_mode rgb_depth_separate --few_shot_dir $DATA_DIR/annotations --num_examples 3
+# Few-shot with Qwen/Qwen3-VL-4B-Instruct (RGB + Depth, 3 examples) - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=06:00:00 \
+    --job-name=fs_qwen3_4b_rgbd \
+    --output="$WORK/free_ground_results/slurm_logs/fs_qwen3_4b_rgbd_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy few_shot --model Qwen/Qwen3-VL-4B-Instruct --input_mode rgb_depth_separate --few_shot_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations --num_examples 3 --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
 
-# Few-shot with gemma-4-E4B-it (RGB + Depth, 3 examples)
-python $PIPELINE_SCRIPT --strategy few_shot --model gemma-4-E4B-it --input_mode rgb_depth_separate --few_shot_dir $DATA_DIR/annotations --num_examples 3
+# Few-shot with gemma-4-E4B-it (RGB + Depth, 3 examples) - V100
+sbatch --partition=v100 --gres=gpu:v100:1 --time=06:00:00 \
+    --job-name=fs_gemma_4e4b_rgbd \
+    --output="$WORK/free_ground_results/slurm_logs/fs_gemma_4e4b_rgbd_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy few_shot --model gemma-4-E4B-it --input_mode rgb_depth_separate --few_shot_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations --num_examples 3 --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
 
 # ==============================================================================
 # TWO-VLM EXPERIMENTS
 # ==============================================================================
 
-# Two-VLM with same model (Qwen2.5-VL-7B-Instruct, RGB + Depth)
-python $PIPELINE_SCRIPT --strategy two_vlm --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate
+# Two-VLM with same model (Qwen2.5-VL-7B-Instruct, RGB + Depth) - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=06:00:00 \
+    --job-name=tv_qwen25_7b_same \
+    --output="$WORK/free_ground_results/slurm_logs/tv_qwen25_7b_same_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy two_vlm --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
 
-# Two-VLM with same model (Qwen3.5-2B, RGB + Depth)
-python $PIPELINE_SCRIPT --strategy two_vlm --model Qwen3.5-2B --input_mode rgb_depth_separate
+# Two-VLM with same model (Qwen3.5-2B, RGB + Depth) - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=06:00:00 \
+    --job-name=tv_qwen35_2b_same \
+    --output="$WORK/free_ground_results/slurm_logs/tv_qwen35_2b_same_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy two_vlm --model Qwen3.5-2B --input_mode rgb_depth_separate --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
 
-# Two-VLM with same model (Qwen3-VL-4B-Instruct, RGB + Depth)
-python $PIPELINE_SCRIPT --strategy two_vlm --model Qwen3-VL-4B-Instruct --input_mode rgb_depth_separate
+# Two-VLM with same model (Qwen/Qwen3-VL-4B-Instruct, RGB + Depth) - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=06:00:00 \
+    --job-name=tv_qwen3_4b_same \
+    --output="$WORK/free_ground_results/slurm_logs/tv_qwen3_4b_same_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy two_vlm --model Qwen/Qwen3-VL-4B-Instruct --input_mode rgb_depth_separate --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
 
-# Two-VLM with same model (gemma-4-E4B-it, RGB + Depth)
-python $PIPELINE_SCRIPT --strategy two_vlm --model gemma-4-E4B-it --input_mode rgb_depth_separate
+# Two-VLM with same model (gemma-4-E4B-it, RGB + Depth) - V100
+sbatch --partition=v100 --gres=gpu:v100:1 --time=06:00:00 \
+    --job-name=tv_gemma_4e4b_same \
+    --output="$WORK/free_ground_results/slurm_logs/tv_gemma_4e4b_same_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy two_vlm --model gemma-4-E4B-it --input_mode rgb_depth_separate --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
 
-# Two-VLM with different models (Qwen2.5-VL-7B-Instruct + gemma-4-E4B-it, RGB + Depth)
-python $PIPELINE_SCRIPT --strategy two_vlm --reasoner_model Qwen2.5-VL-7B-Instruct --evaluator_model gemma-4-E4B-it --input_mode rgb_depth_separate
+# Two-VLM with different models (Qwen2.5-VL-7B-Instruct + gemma-4-E4B-it, RGB + Depth) - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=06:00:00 \
+    --job-name=tv_qwen25_7b_gemma \
+    --output="$WORK/free_ground_results/slurm_logs/tv_qwen25_7b_gemma_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy two_vlm --reasoner_model Qwen2.5-VL-7B-Instruct --evaluator_model gemma-4-E4B-it --input_mode rgb_depth_separate --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
 
-# Two-VLM with different models (Qwen3-VL-4B-Instruct + gemma-4-E4B-it, RGB + Depth)
-python $PIPELINE_SCRIPT --strategy two_vlm --reasoner_model Qwen3-VL-4B-Instruct --evaluator_model gemma-4-E4B-it --input_mode rgb_depth_separate
+# Two-VLM with different models (Qwen/Qwen3-VL-4B-Instruct + gemma-4-E4B-it, RGB + Depth) - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=06:00:00 \
+    --job-name=tv_qwen3_4b_gemma \
+    --output="$WORK/free_ground_results/slurm_logs/tv_qwen3_4b_gemma_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy two_vlm --reasoner_model Qwen/Qwen3-VL-4B-Instruct --evaluator_model gemma-4-E4B-it --input_mode rgb_depth_separate --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
 
 # ==============================================================================
 # SA2VA EXPERIMENTS
 # ==============================================================================
 
-# SA2VA with ByteDance/Sa2VA-Qwen3-VL-4B (RGB only)
-python $PIPELINE_SCRIPT --strategy sa2va --model ByteDance/Sa2VA-Qwen3-VL-4B --input_mode rgb_only
+# SA2VA with ByteDance/Sa2VA-Qwen3-VL-4B (RGB only) - A100
+sbatch --partition=a100 --gres=gpu:a100:1 --time=20:00:00 \
+    --job-name=sa2va_rgb \
+    --output="$WORK/free_ground_results/slurm_logs/sa2va_rgb_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy sa2va --model ByteDance/Sa2VA-Qwen3-VL-4B --input_mode rgb_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations --clean"
 
-# SA2VA with ByteDance/Sa2VA-Qwen3-VL-4B (RGB + Depth)
-python $PIPELINE_SCRIPT --strategy sa2va --model ByteDance/Sa2VA-Qwen3-VL-4B --input_mode rgb_depth_separate
-
-# ==============================================================================
-# EVALUATION COMMANDS
-# ==============================================================================
-
-# Evaluate all results
-python evaluate_all.py --output_dir $OUTPUT_DIR
-
-# Compare different strategies
-python compare_strategies.py --output_dir $OUTPUT_DIR
-
-# Compare specific strategies
-python compare_strategies.py --output_dir $OUTPUT_DIR --strategies zero_shot sa2va
-
-# Compare specific models
-python compare_strategies.py --output_dir $OUTPUT_DIR --models Qwen2.5-VL-7B-Instruct Qwen3.5-2B
+# SA2VA with ByteDance/Sa2VA-Qwen3-VL-4B (RGB + Depth) - A100
+sbatch --partition=a100 --gres=gpu:a100:1 --time=20:00:00 \
+    --job-name=sa2va_rgbd \
+    --output="$WORK/free_ground_results/slurm_logs/sa2va_rgbd_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy sa2va --model ByteDance/Sa2VA-Qwen3-VL-4B --input_mode rgb_depth_separate --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations --clean"
 
 # ==============================================================================
 # QUICK TEST COMMANDS (3 images per folder)
 # ==============================================================================
 
-# Quick test: Zero-shot with Qwen2.5-VL-7B-Instruct
-python $PIPELINE_SCRIPT --strategy zero_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate --quick_test
+# Quick test: Zero-shot with Qwen2.5-VL-7B-Instruct - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=01:00:00 \
+    --job-name=qt_zs_qwen25_7b \
+    --output="$WORK/free_ground_results/slurm_logs/qt_zs_qwen25_7b_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy zero_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate --quick_test --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
 
-# Quick test: SA2VA
-python $PIPELINE_SCRIPT --strategy sa2va --model ByteDance/Sa2VA-Qwen3-VL-4B --input_mode rgb_depth_separate --quick_test
+# Quick test: SA2VA - A100
+sbatch --partition=a100 --gres=gpu:a100:1 --time=01:00:00 \
+    --job-name=qt_sa2va \
+    --output="$WORK/free_ground_results/slurm_logs/qt_sa2va_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy sa2va --model ByteDance/Sa2VA-Qwen3-VL-4B --input_mode rgb_depth_separate --quick_test --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
 
 # ==============================================================================
 # SPECIFIC IMAGE COMMANDS
 # ==============================================================================
 
-# Run on specific images
-python $PIPELINE_SCRIPT --strategy zero_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate --specific_images 116 124 405
+# Run on specific images - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=01:00:00 \
+    --job-name=si_zs_qwen25_7b \
+    --output="$WORK/free_ground_results/slurm_logs/si_zs_qwen25_7b_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy zero_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate --specific_images 116 124 405 --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
 
-# Run on specific folders
-python $PIPELINE_SCRIPT --strategy zero_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate --folders lms_kamal_LA_downstairs_Nopeople_1 lms_kamal_LA_upstairs_Nopeople_1
+# Run on specific folders - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=02:00:00 \
+    --job-name=sf_zs_qwen25_7b \
+    --output="$WORK/free_ground_results/slurm_logs/sf_zs_qwen25_7b_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy zero_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate --folders lms_kamal_LA_downstairs_Nopeople_1 lms_kamal_LA_upstairs_Nopeople_1 --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
+
+# ==============================================================================
+# SAM3 INPUT MODE EXPERIMENTS (VLM strategies only)
+# ==============================================================================
+# SAM3 input modes: text_only (VLM text), bbox_only (VLM bbox), text_and_bbox (both)
+
+# Zero-shot with Qwen2.5-VL-7B-Instruct - SAM3 text_only - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=06:00:00 \
+    --job-name=zs_qwen25_7b_text \
+    --output="$WORK/free_ground_results/slurm_logs/zs_qwen25_7b_text_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy zero_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate --sam3_input_mode text_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
+
+# Zero-shot with Qwen2.5-VL-7B-Instruct - SAM3 bbox_only - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=06:00:00 \
+    --job-name=zs_qwen25_7b_bbox \
+    --output="$WORK/free_ground_results/slurm_logs/zs_qwen25_7b_bbox_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy zero_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate --sam3_input_mode bbox_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
+
+# Zero-shot with Qwen2.5-VL-7B-Instruct - SAM3 text_and_bbox - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=06:00:00 \
+    --job-name=zs_qwen25_7b_both \
+    --output="$WORK/free_ground_results/slurm_logs/zs_qwen25_7b_both_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy zero_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate --sam3_input_mode text_and_bbox --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
+
+# Zero-shot with Qwen3.5-2B - SAM3 bbox_only - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=06:00:00 \
+    --job-name=zs_qwen35_2b_bbox \
+    --output="$WORK/free_ground_results/slurm_logs/zs_qwen35_2b_bbox_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy zero_shot --model Qwen3.5-2B --input_mode rgb_depth_separate --sam3_input_mode bbox_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
+
+# Zero-shot with Qwen/Qwen3-VL-4B-Instruct - SAM3 bbox_only - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=06:00:00 \
+    --job-name=zs_qwen3_4b_bbox \
+    --output="$WORK/free_ground_results/slurm_logs/zs_qwen3_4b_bbox_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy zero_shot --model Qwen/Qwen3-VL-4B-Instruct --input_mode rgb_depth_separate --sam3_input_mode bbox_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
+
+# Zero-shot with gemma-4-E4B-it - SAM3 bbox_only - V100
+sbatch --partition=v100 --gres=gpu:v100:1 --time=06:00:00 \
+    --job-name=zs_gemma_4e4b_bbox \
+    --output="$WORK/free_ground_results/slurm_logs/zs_gemma_4e4b_bbox_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy zero_shot --model gemma-4-E4B-it --input_mode rgb_depth_separate --sam3_input_mode bbox_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
+
+# Two-VLM with Qwen2.5-VL-7B-Instruct - SAM3 bbox_only - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=06:00:00 \
+    --job-name=tv_qwen25_7b_bbox \
+    --output="$WORK/free_ground_results/slurm_logs/tv_qwen25_7b_bbox_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy two_vlm --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate --sam3_input_mode bbox_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
+
+# Two-VLM with Qwen3.5-2B - SAM3 bbox_only - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=06:00:00 \
+    --job-name=tv_qwen35_2b_bbox \
+    --output="$WORK/free_ground_results/slurm_logs/tv_qwen35_2b_bbox_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy two_vlm --model Qwen3.5-2B --input_mode rgb_depth_separate --sam3_input_mode bbox_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
+
+# Two-VLM with Qwen/Qwen3-VL-4B-Instruct - SAM3 bbox_only - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=06:00:00 \
+    --job-name=tv_qwen3_4b_bbox \
+    --output="$WORK/free_ground_results/slurm_logs/tv_qwen3_4b_bbox_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy two_vlm --model Qwen/Qwen3-VL-4B-Instruct --input_mode rgb_depth_separate --sam3_input_mode bbox_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
+
+# Two-VLM with gemma-4-E4B-it - SAM3 bbox_only - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=06:00:00 \
+    --job-name=tv_gemma_4e4b_bbox \
+    --output="$WORK/free_ground_results/slurm_logs/tv_gemma_4e4b_bbox_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy two_vlm --model gemma-4-E4B-it --input_mode rgb_depth_separate --sam3_input_mode bbox_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
+
+# Two-VLM with Qwen2.5-VL-7B-Instruct + gemma-4-E4B-it - SAM3 bbox_only - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=06:00:00 \
+    --job-name=tv_qwen25_7b_gemma_bbox \
+    --output="$WORK/free_ground_results/slurm_logs/tv_qwen25_7b_gemma_bbox_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy two_vlm --reasoner_model Qwen2.5-VL-7B-Instruct --evaluator_model gemma-4-E4B-it --input_mode rgb_depth_separate --sam3_input_mode bbox_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
+
+# Two-VLM with Qwen/Qwen3-VL-4B-Instruct + gemma-4-E4B-it - SAM3 bbox_only - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=06:00:00 \
+    --job-name=tv_qwen3_4b_gemma_bbox \
+    --output="$WORK/free_ground_results/slurm_logs/tv_qwen3_4b_gemma_bbox_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy two_vlm --reasoner_model Qwen/Qwen3-VL-4B-Instruct --evaluator_model gemma-4-E4B-it --input_mode rgb_depth_separate --sam3_input_mode bbox_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations"
+
+# ==============================================================================
+# EVALUATION COMMANDS
+# ==============================================================================
+
+# Evaluate all results - Work partition
+sbatch --partition=work --gres=gpu:1 --time=02:00:00 \
+    --job-name=eval_all \
+    --output="$WORK/free_ground_results/slurm_logs/eval_all_%j.out" \
+    --export=ALL \
+    --wrap="cd $HOME/lac_free_ground && python3 evaluate_all.py --output_dir $OUTPUT_DIR"
+
+# Compare different strategies - Work partition
+sbatch --partition=work --gres=gpu:1 --time=02:00:00 \
+    --job-name=compare_strategies \
+    --output="$WORK/free_ground_results/slurm_logs/compare_strategies_%j.out" \
+    --export=ALL \
+    --wrap="cd $HOME/lac_free_ground && python3 compare_strategies.py --output_dir $OUTPUT_DIR"
+
+# Compare specific strategies - Work partition
+sbatch --partition=work --gres=gpu:1 --time=01:00:00 \
+    --job-name=compare_specific \
+    --output="$WORK/free_ground_results/slurm_logs/compare_specific_%j.out" \
+    --export=ALL \
+    --wrap="cd $HOME/lac_free_ground && python3 compare_strategies.py --output_dir $OUTPUT_DIR --strategies zero_shot sa2va"
+
+# Compare specific models - Work partition
+sbatch --partition=work --gres=gpu:1 --time=01:00:00 \
+    --job-name=compare_models \
+    --output="$WORK/free_ground_results/slurm_logs/compare_models_%j.out" \
+    --export=ALL \
+    --wrap="cd $HOME/lac_free_ground && python3 compare_strategies.py --output_dir $OUTPUT_DIR --models Qwen2.5-VL-7B-Instruct Qwen3.5-2B"
 
 # ==============================================================================
 # OUTPUT DIRECTORY STRUCTURE
@@ -154,13 +359,154 @@ python $PIPELINE_SCRIPT --strategy zero_shot --model Qwen2.5-VL-7B-Instruct --in
 # NOTES
 # ==============================================================================
 #
-# 1. Make sure to set the WORK environment variable to your working directory
-# 2. Modify DATA_DIR if your data is in a different location
-# 3. Adjust --few_shot_dir to point to your annotation directory
-# 4. Use --quick_test for quick debugging (3 images per folder)
-# 5. Use --specific_images to run on specific image IDs
-# 6. Use --folders to run on specific folders only
-# 7. Use --clean to remove output directory before running
-# 8. Use --verbose for DEBUG logging
+# 1. Set WORK environment variable to your working directory
+# 2. Set DATA_DIR to your data directory if different from default
+# 3. All commands use --gt_dir to restrict to 1612 images with proper annotations
+# 4. Adjust --few_shot_dir to point to your annotation directory
+# 5. Modify partition and GPU type based on your cluster configuration
+# 6. Adjust time limits based on your dataset size
+# 7. Use --quick_test for quick debugging (3 images per folder)
+# 8. Use --specific_images to run on specific image IDs
+# 9. Use --folders to run on specific folders only
+# 10. Use --clean to remove output directory before running
+# 11. Use --verbose for DEBUG logging
+# 12. Use --sam3_input_mode to control SAM3 segmentation strategy:
+#    - text_only: Use VLM text description only (default)
+#    - bbox_only: Use VLM bounding boxes only
+#    - text_and_bbox: Use both VLM text and bounding boxes
+#
+# Partition recommendations:
+# - RTX 3080: For VLM models (Qwen, Gemma)
+# - V100: For VLM models (Gemma)
+# - A100: For SA2VA model
+# - Work: For evaluation and comparison
 #
 # ==============================================================================
+
+
+
+
+
+
+
+
+##RAN 
+# ==============================================================================
+# SA2VA EXPERIMENTS
+# ==============================================================================
+# SA2VA with ByteDance/Sa2VA-Qwen3-VL-4B (RGB only) - A100
+sbatch --partition=a100 --gres=gpu:a100:1 --time=20:00:00 \
+    --job-name=sa2va_rgb \
+    --output="$WORK/free_ground_results/slurm_logs/sa2va_rgb_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy sa2va --model ByteDance/Sa2VA-Qwen3-VL-4B --input_mode rgb_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations --clean"
+
+# SA2VA with ByteDance/Sa2VA-Qwen3-VL-4B (RGB + Depth) - A100
+sbatch --partition=a100 --gres=gpu:a100:1 --time=20:00:00 \
+    --job-name=sa2va_rgbd \
+    --output="$WORK/free_ground_results/slurm_logs/sa2va_rgbd_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy sa2va --model ByteDance/Sa2VA-Qwen3-VL-4B --input_mode rgb_depth_separate --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations --clean"
+
+
+# ==============================================================================
+# ZERO-SHOT EXPERIMENTS
+# ==============================================================================
+# Zero-shot with Qwen2.5-VL-7B-Instruct (RGB only) - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=20:00:00 \
+    --job-name=zs_qwen25_7b_rgb \
+    --output="$WORK/free_ground_results/slurm_logs/zs_qwen25_7b_rgb_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy zero_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations --clean"
+
+# Zero-shot with Qwen2.5-VL-7B-Instruct (RGB + Depth) - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=20:00:00 \
+    --job-name=zs_qwen25_7b_rgbd \
+    --output="$WORK/free_ground_results/slurm_logs/zs_qwen25_7b_rgbd_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy zero_shot --model Qwen2.5-VL-7B-Instruct --input_mode rgb_depth_separate --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations --clean" 
+
+
+# Zero-shot with gemma-4-E4B-it (RGB only) - V100
+sbatch --partition=v100 --gres=gpu:v100:1 --time=20:00:00 \
+    --job-name=zs_gemma_4e4b_rgb \
+    --output="$WORK/free_ground_results/slurm_logs/zs_gemma_4e4b_rgb_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy zero_shot --model gemma-4-E4B-it --input_mode rgb_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations --clean"
+
+# Zero-shot with gemma-4-E4B-it (RGB + Depth) - V100
+sbatch --partition=v100 --gres=gpu:v100:1 --time=20:00:00 \
+    --job-name=zs_gemma_4e4b_rgbd \
+    --output="$WORK/free_ground_results/slurm_logs/zs_gemma_4e4b_rgbd_%j.out" \
+    --export=ALL \
+    --wrap="export HF_HOME=$WORK/.cache/huggingface && export HF_HUB_OFFLINE=1 && cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --strategy zero_shot --model gemma-4-E4B-it --input_mode rgb_depth_separate --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations --clean"
+
+
+####For Test Data Experimentation
+# rgb_only
+sbatch --partition=v100 --gres=gpu:v100:1 --time=04:00:00 \
+  --job-name=sa2va_rgb --output=$WORK/logs/sa2va_rgb_%j.out \
+  --export=ALL \
+  --wrap="export HF_HOME=$WORK/.cache/huggingface && cd /home/hpc/iwnt/iwnt164h/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --config paper_test_data_config.yaml --strategy sa2va --model ByteDance/Sa2VA-Qwen3-VL-4B --input_mode rgb_only"
+
+# rgb_depth_separate
+sbatch --partition=v100 --gres=gpu:v100:1 --time=04:00:00 \
+  --job-name=sa2va_rgbd --output=$WORK/logs/sa2va_rgbd_%j.out \
+  --export=ALL \
+  --wrap="export HF_HOME=$WORK/.cache/huggingface && cd /home/hpc/iwnt/iwnt164h/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --config paper_test_data_config.yaml --strategy sa2va --model ByteDance/Sa2VA-Qwen3-VL-4B --input_mode rgb_depth_separate"
+
+# ==============================================================================
+# TIPSv2 EXPERIMENTS (Zero-Shot Segmentation via Text-Patch Similarity)
+# ==============================================================================
+# TIPSv2 uses a vision encoder (ViT) + text encoder to compute patch-level
+# cosine similarity with class text prompts. No VLM or SAM3 needed.
+#
+# Prerequisites:
+#   1. Clone TIPS repo: git clone https://github.com/google-deepmind/tips.git ~/tips_repo
+#   2. Install deps: pip install tensorflow_text
+#   3. Checkpoints auto-download to $WORK/tipsv2_checkpoints on first run
+#
+# Variants: B (303M), L (303M), So (412M), g (1.1B)
+# Recommended: L (good balance of speed and quality)
+
+# TIPSv2-L with sliding window inference (RGB only) - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=06:00:00 \
+    --job-name=tipsv2_L_slide_rgb \
+    --output="$WORK/free_ground_results/slurm_logs/tipsv2_L_slide_rgb_%j.out" \
+    --export=ALL \
+    --wrap="cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --config tipsv2_config.yaml --strategy tipsv2 --model L --input_mode rgb_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations --clean"
+
+# TIPSv2-L with whole-image inference (faster, lower quality) - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=04:00:00 \
+    --job-name=tipsv2_L_whole_rgb \
+    --output="$WORK/free_ground_results/slurm_logs/tipsv2_L_whole_rgb_%j.out" \
+    --export=ALL \
+    --wrap="cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --config tipsv2_config.yaml --strategy tipsv2 --model L --input_mode rgb_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations --clean --output_suffix _whole"
+
+# TIPSv2-B (smaller, faster) with sliding window - RTX 3080
+sbatch --partition=rtx3080 --gres=gpu:1 --time=04:00:00 \
+    --job-name=tipsv2_B_slide_rgb \
+    --output="$WORK/free_ground_results/slurm_logs/tipsv2_B_slide_rgb_%j.out" \
+    --export=ALL \
+    --wrap="cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --config tipsv2_config.yaml --strategy tipsv2 --model B --input_mode rgb_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations --clean --output_suffix _B"
+
+# TIPSv2-So (larger, better quality) with sliding window - V100
+sbatch --partition=v100 --gres=gpu:v100:1 --time=08:00:00 \
+    --job-name=tipsv2_So_slide_rgb \
+    --output="$WORK/free_ground_results/slurm_logs/tipsv2_So_slide_rgb_%j.out" \
+    --export=ALL \
+    --wrap="cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --config tipsv2_config.yaml --strategy tipsv2 --model So --input_mode rgb_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations --clean --output_suffix _So"
+
+# TIPSv2-g (largest, best quality) with sliding window - V100
+sbatch --partition=v100 --gres=gpu:v100:1 --time=12:00:00 \
+    --job-name=tipsv2_g_slide_rgb \
+    --output="$WORK/free_ground_results/slurm_logs/tipsv2_g_slide_rgb_%j.out" \
+    --export=ALL \
+    --wrap="cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --config tipsv2_config.yaml --strategy tipsv2 --model g --input_mode rgb_only --gt_dir /home/woody/iwnt/iwnt164h/mlp_ground_truth/proper_annotations --clean --output_suffix _g"
+
+# Quick test: TIPSv2-L on 3 images per folder
+sbatch --partition=rtx3080 --gres=gpu:1 --time=01:00:00 \
+    --job-name=tipsv2_L_quick \
+    --output="$WORK/free_ground_results/slurm_logs/tipsv2_L_quick_%j.out" \
+    --export=ALL \
+    --wrap="cd $HOME/lac_free_ground && $WORK/venvs/marigold/bin/python3 walkable_area_pipeline.py --config tipsv2_config.yaml --strategy tipsv2 --model L --input_mode rgb_only --quick_test --clean --output_suffix _quick"

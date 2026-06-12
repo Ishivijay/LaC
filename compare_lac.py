@@ -61,16 +61,23 @@ def discover_gt_annotations(gt_mask_dir: Path) -> Dict[str, tuple]:
     return annotations
 
 
-def discover_runs(results_dir: Path) -> List[Dict]:
+def discover_runs(results_dir: Path, strategy_filter: str = None,
+                   model_filter: str = None, input_mode_filter: str = None) -> List[Dict]:
     """Discover all pipeline runs from the results directory.
 
     Scans: {results_dir}/{strategy}/{model_tag}/{input_mode}/
+    
+    Args:
+        results_dir: Directory containing pipeline results
+        strategy_filter: Filter by strategy (e.g., sa2va, zero_shot)
+        model_filter: Filter by model tag (e.g., Sa2VA-Qwen3-VL-4B)
+        input_mode_filter: Filter by input mode (e.g., rgb_only, rgb_only_sa2va)
     """
     runs = []
     if not results_dir.exists():
         return runs
 
-    VALID_MODES = {"rgb_only", "rgb_depth_separate"}
+    VALID_MODES = {"rgb_only", "rgb_depth_separate", "rgb_only_sa2va", "rgb_depth_separate_sa2va"}
     skip_dirs = {"slurm_logs", "logs", "evaluation", "comparison", "evaluation_v2",
                  "comparison_v2", "Annotated_Ground_Truth",
                  "lac_navigable_evaluation", "lac_navigable_comparison",
@@ -80,16 +87,28 @@ def discover_runs(results_dir: Path) -> List[Dict]:
         if not strategy_dir.is_dir() or strategy_dir.name in skip_dirs:
             continue
         strategy = strategy_dir.name
+        
+        # Filter by strategy
+        if strategy_filter and strategy != strategy_filter:
+            continue
 
         for model_dir in sorted(strategy_dir.iterdir()):
             if not model_dir.is_dir():
                 continue
             model_tag = model_dir.name
+            
+            # Filter by model
+            if model_filter and model_tag != model_filter:
+                continue
 
             for mode_dir in sorted(model_dir.iterdir()):
                 if not mode_dir.is_dir() or mode_dir.name not in VALID_MODES:
                     continue
                 input_mode = mode_dir.name
+                
+                # Filter by input mode
+                if input_mode_filter and input_mode != input_mode_filter:
+                    continue
 
                 parts = model_tag.split("_")
                 reasoner_model = parts[0]
@@ -472,6 +491,12 @@ def main():
     parser.add_argument("--results_dir", type=Path, default=DEFAULT_RESULTS_DIR)
     parser.add_argument("--gt_mask_dir", type=Path, default=DEFAULT_GT_MASK_DIR)
     parser.add_argument("--output_dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--strategy", type=str, default=None,
+                        help="Filter by strategy (e.g., sa2va, zero_shot, few_shot, two_vlm)")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Filter by model tag (e.g., Sa2VA-Qwen3-VL-4B)")
+    parser.add_argument("--input_mode", type=str, default=None,
+                        help="Filter by input mode (e.g., rgb_only, rgb_depth_separate, rgb_only_sa2va)")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -481,8 +506,11 @@ def main():
     tee = Tee(log_path)
     sys.stdout = tee
 
-    # Discover runs
-    runs = discover_runs(args.results_dir)
+    # Discover runs with filters
+    runs = discover_runs(args.results_dir,
+                         strategy_filter=args.strategy,
+                         model_filter=args.model,
+                         input_mode_filter=args.input_mode)
 
     print("=" * 60)
     print("FREE GROUND DETECTION — STRATEGY COMPARISON")
